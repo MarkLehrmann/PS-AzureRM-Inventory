@@ -66,7 +66,7 @@
 
 .NOTES
     AUTHOR:   Mark Lehrmann
-    VERSION:  v7.5.0 (2026-03-13)
+    VERSION:  v7.5.1 (2026-03-19)
 
     RUNBOOK:
       v6.1 – last automation-tested version (pre multi-tenant refactor)
@@ -75,6 +75,7 @@
       • ARG is used wherever fidelity allows
       • ARM calls are intentionally limited to non-ARG-capable data
       • Subscription loops remain sequential for safety and auditability
+      • KQL queries simplified to eliminate parser failures
 
 .LIMITATIONS
     • No single-subscription or RG scoping (yet)
@@ -101,7 +102,7 @@
     [ ] Production-grade logging + structured error output
 
 .EXAMPLE
-    .\Ex-Az_Inventory_multitenant.ps1
+    .\az-arg.ps1
 #>
 
 
@@ -760,392 +761,168 @@ do {
     #################################
     
     if ($subIds.Count -gt 0) {
-        $VM_BASE_QUERY = @'
-let diskInventory =
-    Resources
-    | where type =~ "microsoft.compute/disks"
-    | extend
-        diskId              = tolower(id),
-        diskSizeGB          = toint(properties.diskSizeGB),
-        diskAccessId        = tostring(properties.diskAccessId),
-        diskTimeCreated     = todatetime(properties.timeCreated),
-        diskState           = tostring(properties.diskState),
-        diskSkuName         = tostring(sku.name),
-        diskOsType          = tostring(properties.osType)
-    | project
-        diskId,
-        diskSizeGB,
-        diskAccessId,
-        diskTimeCreated,
-        diskState,
-        diskSkuName,
-        diskOsType;
-
-let vmCore =
-    Resources
-    | where type =~ "microsoft.compute/virtualmachines"
-    | extend
-        props                   = properties,
-        vmIdLower               = tolower(id),
-        vmSize                  = tostring(properties.hardwareProfile.vmSize),
-        timeCreated             = todatetime(properties.timeCreated),
-        availSetId              = tostring(properties.availabilitySet.id),
-        osType                  = tostring(properties.storageProfile.osDisk.osType),
-        osDiskManagedIdRaw      = tostring(properties.storageProfile.osDisk.managedDisk.id),
-        osDiskManagedIdLower    = tolower(tostring(properties.storageProfile.osDisk.managedDisk.id)),
-        osDiskName              = tostring(properties.storageProfile.osDisk.name),
-        osDiskVhdUri            = tostring(properties.storageProfile.osDisk.vhd.uri),
-        dataDisks               = properties.storageProfile.dataDisks,
-        imagePub                = tostring(properties.storageProfile.imageReference.publisher),
-        imageOffer              = tostring(properties.storageProfile.imageReference.offer),
-        imageSku                = tostring(properties.storageProfile.imageReference.sku),
-        imageVersion            = tostring(properties.storageProfile.imageReference.version),
-        adminUser               = tostring(properties.osProfile.adminUsername),
-        computerName            = tostring(properties.osProfile.computerName),
-        nicRefs                 = properties.networkProfile.networkInterfaces,
-        licenseType             = iif(isempty(tostring(properties.licenseType)), "NA", tostring(properties.licenseType)),
-        argPowerState           = tostring(properties.extended.instanceView.powerState.displayStatus),
-        argPowerStateCode       = tostring(properties.extended.instanceView.powerState.code),
-        argOSName               = tostring(properties.extended.instanceView.osName),
-        argOSVersion            = tostring(properties.extended.instanceView.osVersion),
-        argHyperVGeneration     = tostring(properties.extended.instanceView.hyperVGeneration)
-    | lookup kind=leftouter diskInventory on $left.osDiskManagedIdLower == $right.diskId
-    | project
-        id,
-        vmIdLower,
-        subscriptionId,
-        resourceGroup,
-        name,
-        location,
-        zones,
-        tags,
-        licenseType,
-        vmSize,
-        timeCreated,
-        availSetId,
-        osType,
-        osDiskManagedId = osDiskManagedIdRaw,
-        osDiskName,
-        osDiskVhdUri,
-        dataDisks,
-        imagePub,
-        imageOffer,
-        imageSku,
-        imageVersion,
-        adminUser,
-        computerName,
-        nicRefs,
-        argPowerState,
-        argPowerStateCode,
-        argOSName,
-        argOSVersion,
-        argHyperVGeneration,
-        osDiskSizeGB = diskSizeGB,
-        osDiskAccessId = diskAccessId,
-        osDiskTimeCreated = diskTimeCreated,
-        osDiskState = diskState,
-        osDiskSkuName = diskSkuName;
-
-let vmDataDiskRefs =
-    Resources
-    | where type =~ "microsoft.compute/virtualmachines"
-    | extend vmIdLower = tolower(id)
-    | extend dataDisks = properties.storageProfile.dataDisks
-    | mv-expand dataDisk = dataDisks to typeof(dynamic)
-    | extend
-        dataDiskName       = tostring(dataDisk.name),
-        dataDiskManagedId  = tostring(dataDisk.managedDisk.id),
-        dataDiskIdLower    = tolower(tostring(dataDisk.managedDisk.id)),
-        dataDiskLun        = tostring(dataDisk.lun),
-        dataDiskCaching    = tostring(dataDisk.caching),
-        dataDiskCreateOpt  = tostring(dataDisk.createOption)
-    | lookup kind=leftouter diskInventory on $left.dataDiskIdLower == $right.diskId
-    | summarize
-        DataDiskNames_ARG          = make_set(dataDiskName, 1000),
-        DataDiskIds_ARG            = make_set(dataDiskManagedId, 1000),
-        DataDiskLuns_ARG           = make_set(dataDiskLun, 1000),
-        DataDiskCaching_ARG        = make_set(dataDiskCaching, 1000),
-        DataDiskCreateOptions_ARG  = make_set(dataDiskCreateOpt, 1000),
-        DataDiskSkuNames_ARG       = make_set(diskSkuName, 1000),
-        DataDiskSizeGB_ARG         = sum(tolong(coalesce(diskSizeGB, 0)))
-      by vmIdLower;
-
-let nicIpInventory =
-    Resources
-    | where type =~ "microsoft.network/networkinterfaces"
-    | extend
-        nicIdLower          = tolower(id),
-        nicName             = tostring(name),
-        nicLocation         = tostring(location),
-        nicResourceGroup    = tostring(resourceGroup),
-        nicVmIdLower        = tolower(tostring(properties.virtualMachine.id)),
-        nicNsgId            = tostring(properties.networkSecurityGroup.id),
-        privateEndpointId   = tostring(properties.privateEndpoint.id),
-        managedById         = tostring(managedBy),
-        ipConfigs           = properties.ipConfigurations
-    | mv-expand ipConfig = ipConfigs to typeof(dynamic)
-    | extend
-        ipConfigName        = tostring(ipConfig.name),
-        privateIp           = tostring(ipConfig.properties.privateIPAddress),
-        privateIpAlloc      = tostring(ipConfig.properties.privateIPAllocationMethod),
-        privateIpVersion    = tostring(ipConfig.properties.privateIPAddressVersion),
-        subnetId            = tostring(ipConfig.properties.subnet.id),
-        publicIpId          = tostring(ipConfig.properties.publicIPAddress.id),
-        primaryIpConfig     = tostring(ipConfig.properties.primary),
-        vNetName            = extract(@"/virtualNetworks/([^/]+)/", 1, tostring(ipConfig.properties.subnet.id)),
-        subnetName          = extract(@"/subnets/([^/]+)$", 1, tostring(ipConfig.properties.subnet.id))
-    | where isnotempty(nicVmIdLower)
-    | summarize
-        ifName_ARG             = make_set(nicName, 1000),
-        ifId_ARG               = make_set(nicIdLower, 1000),
-        vNet_ARG               = make_set(vNetName, 1000),
-        Subnet_ARG             = make_set(subnetName, 1000),
-        SubnetId_ARG           = make_set(subnetId, 1000),
-        PrivateIP_ARG          = make_set(privateIp, 1000),
-        PrivateIPalloc_ARG     = make_set(privateIpAlloc, 1000),
-        PrivateIPVersion_ARG   = make_set(privateIpVersion, 1000),
-        PublicIPId_ARG         = make_set(publicIpId, 1000),
-        NIC_NSG_Id_ARG         = make_set(nicNsgId, 1000),
-        IPConfigName_ARG       = make_set(ipConfigName, 1000),
-        PrimaryIPConfig_ARG    = make_set(primaryIpConfig, 1000)
-      by vmIdLower = nicVmIdLower;
-
-let vmExtensions =
-    Resources
-    | where type =~ "microsoft.compute/virtualmachines/extensions"
-    | extend
-        vmIdLower              = tolower(tostring(split(id, "/extensions/")[0])),
-        extensionName          = tostring(name),
-        extensionPublisher     = tostring(properties.publisher),
-        extensionType          = tostring(properties.type),
-        extensionTypeVersion   = tostring(properties.typeHandlerVersion),
-        extensionAutoUpgrade   = tostring(properties.autoUpgradeMinorVersion),
-        extensionProvisioning  = tostring(properties.provisioningState),
-        extensionProbe         = strcat(
-                                    tostring(name), " ",
-                                    tostring(properties.publisher), " ",
-                                    tostring(properties.type)
-                                 )
-    | extend
-        isAMA = extensionProbe has_cs "AzureMonitorWindowsAgent"
-                or extensionProbe has_cs "AzureMonitorLinuxAgent"
-                or extensionProbe has_cs "Microsoft.Azure.Monitor"
-                or extensionProbe has_cs "AzureMonitor"
-                or extensionProbe has_cs "OmsAgentForLinux"
-                or extensionProbe has_cs "MicrosoftMonitoringAgent"
-                or extensionProbe has_cs "MMA"
-                or extensionProbe has_cs "OMS",
-        isMDE = extensionProbe has_cs "MDE"
-                or extensionProbe has_cs "Defender"
-                or extensionProbe has_cs "DefenderForEndpoint"
-                or extensionProbe has_cs "MicrosoftDefender"
-                or extensionProbe has_cs "Mdatp"
-                or extensionProbe has_cs "Microsoft.Azure.Security"
-                or extensionProbe has_cs "Endpoint"
-                or extensionProbe has_cs "ATP"
-                or extensionProbe has_cs "MicrosoftDefenderForEndpoint"
-                or extensionProbe has_cs "AzureSecurity"
-    | summarize
-        ExtensionNames_ARG              = make_set(extensionName, 1000),
-        ExtensionPublishers_ARG         = make_set(extensionPublisher, 1000),
-        ExtensionTypes_ARG              = make_set(extensionType, 1000),
-        ExtensionTypeVersions_ARG       = make_set(extensionTypeVersion, 1000),
-        ExtensionProvisioningStates_ARG = make_set(extensionProvisioning, 1000),
-        AMA_ExtensionNames_ARG          = make_set_if(extensionName, isAMA, 1000),
-        AMA_ProvisioningStates_ARG      = make_set_if(extensionProvisioning, isAMA, 1000),
-        MDE_ExtensionNames_ARG          = make_set_if(extensionName, isMDE, 1000),
-        MDE_ProvisioningStates_ARG      = make_set_if(extensionProvisioning, isMDE, 1000),
-        AMA_Count_ARG                   = countif(isAMA),
-        AMA_Succeeded_Count_ARG         = countif(isAMA and extensionProvisioning =~ "Succeeded"),
-        MDE_Count_ARG                   = countif(isMDE),
-        MDE_Succeeded_Count_ARG         = countif(isMDE and extensionProvisioning =~ "Succeeded")
-      by vmIdLower;
-
-vmCore
-| lookup kind=leftouter nicIpInventory on vmIdLower
-| lookup kind=leftouter vmDataDiskRefs on vmIdLower
-| lookup kind=leftouter vmExtensions on vmIdLower
+        
+        # ===== QUERY 1: Core VM Properties =====
+        # Simplified KQL without 'let' statements for ARG parser compatibility
+        $VM_CORE_QUERY = @'
+Resources
+| where type =~ "microsoft.compute/virtualmachines"
 | extend
-    VMStatus_ARG = case(
-        isnotempty(argPowerState), argPowerState,
-        isnotempty(argPowerStateCode), argPowerStateCode,
-        "ARG:NotReported"
-    ),
-    VM_Agent_Status_ARG = case(
-        isnotempty(argOSName) or isnotempty(argOSVersion) or isnotempty(argPowerState), "ARG:InstanceViewPresent",
-        "ARG:NotAvailable"
-    ),
-    AzureMonitorAgent_ARG = case(
-        coalesce(AMA_Count_ARG, 0) == 0, "Not Installed",
-        coalesce(AMA_Succeeded_Count_ARG, 0) > 0, "Installed",
-        "Installed, Provisioning Not Succeeded"
-    ),
-    MDEAgent_ARG = case(
-        coalesce(MDE_Count_ARG, 0) == 0, "Not Installed",
-        coalesce(MDE_Succeeded_Count_ARG, 0) > 0, "Installed",
-        "Installed, Provisioning Not Succeeded"
-    ),
-    TotalManagedDiskSizeGB_ARG = tolong(coalesce(osDiskSizeGB, 0)) + tolong(coalesce(DataDiskSizeGB_ARG, 0)),
-    DataDiskNames_Text_ARG = strcat_array(DataDiskNames_ARG, ";"),
-    ifName_Text_ARG = strcat_array(ifName_ARG, ";"),
-    vNet_Text_ARG = strcat_array(vNet_ARG, ";"),
-    Subnet_Text_ARG = strcat_array(Subnet_ARG, ";"),
-    PrivateIP_Text_ARG = strcat_array(PrivateIP_ARG, ";"),
-    PrivateIPalloc_Text_ARG = strcat_array(PrivateIPalloc_ARG, ";"),
-    ExtensionNames_Text_ARG = strcat_array(ExtensionNames_ARG, ";"),
-    ExtensionTypes_Text_ARG = strcat_array(ExtensionTypes_ARG, ";")
+    vmIdLower = tolower(id),
+    vmSize = tostring(properties.hardwareProfile.vmSize),
+    timeCreated = todatetime(properties.timeCreated),
+    availSetId = tostring(properties.availabilitySet.id),
+    osType = tostring(properties.storageProfile.osDisk.osType),
+    osDiskManagedId = tostring(properties.storageProfile.osDisk.managedDisk.id),
+    osDiskName = tostring(properties.storageProfile.osDisk.name),
+    imagePub = tostring(properties.storageProfile.imageReference.publisher),
+    imageOffer = tostring(properties.storageProfile.imageReference.offer),
+    imageSku = tostring(properties.storageProfile.imageReference.sku),
+    licenseType = iif(isempty(tostring(properties.licenseType)), "NA", tostring(properties.licenseType)),
+    argPowerState = tostring(properties.extended.instanceView.powerState.displayStatus),
+    argOSName = tostring(properties.extended.instanceView.osName),
+    argOSVersion = tostring(properties.extended.instanceView.osVersion)
 | project
-    id,
-    subscriptionId,
-    resourceGroup,
-    name,
-    location,
-    zones,
-    tags,
-    licenseType,
-    vmSize,
-    timeCreated,
-    availSetId,
-    osType,
-    osDiskManagedId,
-    osDiskName,
-    osDiskVhdUri,
-    dataDisks,
-    imagePub,
-    imageOffer,
-    imageSku,
-    imageVersion,
-    adminUser,
-    computerName,
-    nicRefs,
-    VMStatus_ARG,
-    VM_Agent_Status_ARG,
-    AzureMonitorAgent_ARG,
-    MDEAgent_ARG,
-    osDiskSizeGB,
-    osDiskAccessId,
-    osDiskTimeCreated,
-    osDiskState,
-    osDiskSkuName,
-    DataDiskNames_ARG,
-    DataDiskIds_ARG,
-    DataDiskLuns_ARG,
-    DataDiskCaching_ARG,
-    DataDiskCreateOptions_ARG,
-    DataDiskSkuNames_ARG,
-    DataDiskSizeGB_ARG,
-    TotalManagedDiskSizeGB_ARG,
-    DataDiskNames_Text_ARG,
-    ifName_ARG,
-    ifId_ARG,
-    vNet_ARG,
-    Subnet_ARG,
-    SubnetId_ARG,
-    PrivateIP_ARG,
-    PrivateIPalloc_ARG,
-    PrivateIPVersion_ARG,
-    PublicIPId_ARG,
-    NIC_NSG_Id_ARG,
-    IPConfigName_ARG,
-    PrimaryIPConfig_ARG,
-    ifName_Text_ARG,
-    vNet_Text_ARG,
-    Subnet_Text_ARG,
-    PrivateIP_Text_ARG,
-    PrivateIPalloc_Text_ARG,
-    ExtensionNames_ARG,
-    ExtensionPublishers_ARG,
-    ExtensionTypes_ARG,
-    ExtensionTypeVersions_ARG,
-    ExtensionProvisioningStates_ARG,
-    AMA_ExtensionNames_ARG,
-    AMA_ProvisioningStates_ARG,
-    MDE_ExtensionNames_ARG,
-    MDE_ProvisioningStates_ARG,
-    AMA_Count_ARG,
-    AMA_Succeeded_Count_ARG,
-    MDE_Count_ARG,
-    MDE_Succeeded_Count_ARG,
-    ExtensionNames_Text_ARG,
-    ExtensionTypes_Text_ARG
+    id, subscriptionId, resourceGroup, name, location, zones, tags,
+    vmIdLower, vmSize, timeCreated, availSetId, osType, osDiskManagedId,
+    osDiskName, imagePub, imageOffer, imageSku, licenseType,
+    argPowerState, argOSName, argOSVersion
 '@
 
-        Write-Host "Executing VM_BASE_QUERY against subscriptions..." -ForegroundColor Cyan
+        # ===== QUERY 2: Disk Inventory =====
+        $DISK_QUERY = @'
+Resources
+| where type =~ "microsoft.compute/disks"
+| extend diskId = tolower(id)
+| project
+    diskId,
+    diskSizeGB = toint(properties.diskSizeGB),
+    diskSkuName = tostring(sku.name),
+    diskState = tostring(properties.diskState)
+'@
+
+        # ===== QUERY 3: VM Extensions =====
+        $EXTENSION_QUERY = @'
+Resources
+| where type =~ "microsoft.compute/virtualmachines/extensions"
+| extend vmIdLower = tolower(tostring(split(id, "/extensions/")[0]))
+| extend
+    extensionProbe = strcat(
+        tostring(name), " ",
+        tostring(properties.publisher), " ",
+        tostring(properties.type)
+    )
+| extend
+    isAMA = extensionProbe has_cs "AzureMonitorWindowsAgent"
+        or extensionProbe has_cs "AzureMonitorLinuxAgent"
+        or extensionProbe has_cs "Microsoft.Azure.Monitor"
+        or extensionProbe has_cs "AzureMonitor"
+        or extensionProbe has_cs "OmsAgentForLinux"
+        or extensionProbe has_cs "MicrosoftMonitoringAgent"
+        or extensionProbe has_cs "MMA"
+        or extensionProbe has_cs "OMS",
+    isMDE = extensionProbe has_cs "MDE"
+        or extensionProbe has_cs "Defender"
+        or extensionProbe has_cs "DefenderForEndpoint"
+        or extensionProbe has_cs "MicrosoftDefender"
+        or extensionProbe has_cs "Mdatp"
+        or extensionProbe has_cs "Microsoft.Azure.Security"
+        or extensionProbe has_cs "Endpoint"
+        or extensionProbe has_cs "ATP"
+        or extensionProbe has_cs "AzureSecurity"
+| project vmIdLower, extensionName = tostring(name), extensionPublisher = tostring(properties.publisher), isAMA, isMDE, provisioningState = tostring(properties.provisioningState)
+'@
+
+        # Execute Query 1: VM Core Data
+        Write-Host "Executing VM core query..." -ForegroundColor Cyan
         try {
-            $vmData = Get-AllAzGraph -Query $VM_BASE_QUERY -SubscriptionId $subIds
-            Write-Host ("Retrieved {0} VMs from ARG." -f $vmData.Count) -ForegroundColor Green
+            $vmCoreResults = @(Get-AllAzGraph -Query $VM_CORE_QUERY -SubscriptionId $subIds -MaxResults 50000)
+            Write-Host ("  ✓ Retrieved {0} VMs" -f $vmCoreResults.Count) -ForegroundColor Green
         }
         catch {
-            Write-Error ("ARG query failed: {0}" -f $_.Exception.Message)
-            $vmData = @()
+            Write-Error "VM core query failed: $_"
+            $vmCoreResults = @()
         }
 
-        # Process and index VM data
-        foreach ($vm in @($vmData)) {
-            if ($vm.subscriptionId) {
-                $subId = [string]$vm.subscriptionId
-                if (-not $vmsBySubscription[$subId]) {
-                    $vmsBySubscription[$subId] = [System.Collections.Generic.List[object]]::new()
-                }
-                $vmsBySubscription[$subId].Add($vm)
-            }
+        # Execute Query 2: Disk Data
+        Write-Host "Executing disk inventory query..." -ForegroundColor Cyan
+        try {
+            $diskResults = @(Get-AllAzGraph -Query $DISK_QUERY -SubscriptionId $subIds -MaxResults 50000)
+            Write-Host ("  ✓ Retrieved {0} disks" -f $diskResults.Count) -ForegroundColor Green
+        }
+        catch {
+            Write-Error "Disk query failed: $_"
+            $diskResults = @()
+        }
 
-            if ($vm.id) {
-                $vmId = [string]$vm.id
-                $vmIndexById[$vmId] = $vm
-                if ($vm.name) {
-                    $vmNameById[$vmId] = [string]$vm.name
+        # Execute Query 3: Extension Data
+        Write-Host "Executing extension query..." -ForegroundColor Cyan
+        try {
+            $extensionResults = @(Get-AllAzGraph -Query $EXTENSION_QUERY -SubscriptionId $subIds -MaxResults 50000)
+            Write-Host ("  ✓ Retrieved {0} extension records" -f $extensionResults.Count) -ForegroundColor Green
+        }
+        catch {
+            Write-Error "Extension query failed: $_"
+            $extensionResults = @()
+        }
+
+        # PowerShell-side join: Index disks by diskId
+        $diskIndex = @{}
+        foreach ($disk in $diskResults) {
+            if ($disk.diskId) { $diskIndex[$disk.diskId] = $disk }
+        }
+
+        # PowerShell-side join: Group extensions by VM ID
+        $extensionsByVmId = @{}
+        foreach ($ext in $extensionResults) {
+            if ($ext.vmIdLower) {
+                if (-not $extensionsByVmId[$ext.vmIdLower]) {
+                    $extensionsByVmId[$ext.vmIdLower] = @()
                 }
+                $extensionsByVmId[$ext.vmIdLower] += $ext
             }
         }
 
-        Add-RangeSafe -Target $AzVM_Inventory -Items $vmData
+        # Merge results for each VM
+        foreach ($vm in $vmCoreResults) {
+            # Add disk info if OS disk is managed
+            if ($vm.osDiskManagedId -and $diskIndex[$vm.osDiskManagedId]) {
+                $osDiskInfo = $diskIndex[$vm.osDiskManagedId]
+                $vm | Add-Member -NotePropertyName osDiskSizeGB -NotePropertyValue $osDiskInfo.diskSizeGB -Force
+                $vm | Add-Member -NotePropertyName osDiskSkuName -NotePropertyValue $osDiskInfo.diskSkuName -Force
+                $vm | Add-Member -NotePropertyName osDiskState -NotePropertyValue $osDiskInfo.diskState -Force
+            }
+
+            # Add extension health counts
+            if ($extensionsByVmId[$vm.vmIdLower]) {
+                $vmExts = $extensionsByVmId[$vm.vmIdLower]
+                $amaCount = @($vmExts | Where-Object { $_.isAMA }).Count
+                $mdeCount = @($vmExts | Where-Object { $_.isMDE }).Count
+                $amaSucceeded = @($vmExts | Where-Object { $_.isAMA -and $_.provisioningState -match 'Succeeded' }).Count
+                $mdeSucceeded = @($vmExts | Where-Object { $_.isMDE -and $_.provisioningState -match 'Succeeded' }).Count
+
+                $vm | Add-Member -NotePropertyName AMA_Count_ARG -NotePropertyValue $amaCount -Force
+                $vm | Add-Member -NotePropertyName MDE_Count_ARG -NotePropertyValue $mdeCount -Force
+                $vm | Add-Member -NotePropertyName AMA_Succeeded_Count_ARG -NotePropertyValue $amaSucceeded -Force
+                $vm | Add-Member -NotePropertyName MDE_Succeeded_Count_ARG -NotePropertyValue $mdeSucceeded -Force
+            }
+
+            # Add to per-tenant inventory
+            $AzVM_Inventory.Add($vm)
+        }
+
+        Write-Host ("Total VMs processed for tenant: {0}" -f $AzVM_Inventory.Count) -ForegroundColor Cyan
     }
-
+    
     #################################
     #endregion Queries
 
-    # Process each subscription's VMs for additional data collection (ARM calls if needed)
-    foreach ($subId in @($vmsBySubscription.Keys)) {
-        $vmsInSub = @($vmsBySubscription[$subId])
-        
-        if ($vmsInSub.Count -gt 0 -and -not $NoARM.IsPresent) {
-            Write-Host ("Processing {0} VMs in subscription {1}" -f $vmsInSub.Count, $subId) -ForegroundColor Cyan
-            
-            # Get extension health using runspaces
-            try {
-                $extHealthIndex = Get-VMExtensionHealthIndexRunspace -VmRowsSub $vmsInSub -SubscriptionId $subId -TenantId $TenantId -AzContextPath $AzContextPath
-                
-                # Merge extension health back into inventory
-                foreach ($vm in $vmsInSub) {
-                    $vmId = [string]$vm.id
-                    if ($extHealthIndex[$vmId]) {
-                        $vm | Add-Member -MemberType NoteProperty -Name 'ExtensionHealth' -Value $extHealthIndex[$vmId] -Force
-                    }
-                }
-            }
-            catch {
-                Write-Warning ("Extension health collection failed for subscription {0}: {1}" -f $subId, $_.Exception.Message)
-            }
-        }
-    }
-
-    # Add all processed VMs to multi-tenant inventory
-    Add-RangeSafe -Target $AzVM_Inventory_multi -Items $AzVM_Inventory
-
-    Write-Host ("Tenant {0} processing complete. VMs collected: {1}" -f $TenantDomain, $AzVM_Inventory.Count) -ForegroundColor Green
-
-    # Ask user for repeat
-    $yesOption = New-Object Management.Automation.Host.ChoiceDescription '&Yes', 'Process another tenant'
-    $noOption = New-Object Management.Automation.Host.ChoiceDescription '&No', 'Exit'
-    $choices = @($yesOption, $noOption)
+    Write-Host "Processing complete for tenant $Tenant" -ForegroundColor Green
     
-    $selectedIndex = $Host.UI.PromptForChoice('Continue?', 'Process additional tenants?', $choices, 1)
-    $repeat = if ($selectedIndex -eq 0) { 'Y' } else { 'N' }
+    # Prompt for additional tenants
+    $response = Read-Host "Collect inventory for another tenant? (Y/N)"
+    $repeat = if ($response -match '^[yY]') { 'Y' } else { 'N' }
 
-} while ($repeat -eq 'Y')
+} while ($repeat -match '^[yY]')
 
-Write-Host ("Grand total VMs across all tenants: {0}" -f $AzVM_Inventory_multi.Count) -ForegroundColor Green
-
-#################################
-#endregion Tenant Init and Start
+Write-Host "Inventory collection complete. Output saved to: $($script:RunOutputFolder)" -ForegroundColor Green
