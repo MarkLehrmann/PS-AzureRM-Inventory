@@ -7,33 +7,65 @@
     an ARG-first discovery model with ARM augmentation where required.
 
     Primary discovery is performed via Azure Resource Graph (ARG) for scale and speed,
-    with targeted ARM calls used for:
-      • VM power state and OS details
-      • VM extension and agent health
-      • Network Security Groups (rules + associations)
-      • Load Balancers (frontend/backend configuration)
+    with targeted ARM calls used only where required.
+
+    ARG is used as the authoritative source for:
+    • Virtual Machines (core properties, disks, NIC references, image metadata)
+    • Network Interfaces (IP configuration and VM association)
+    • Network Security Groups (rules, NIC and subnet associations)
+    • Virtual Networks and subnets
+    • Public IP Addresses
+    • Managed Disks
+
+    Targeted ARM calls are reserved for data not reliably available via ARG:
+    • VM power state and runtime OS details (instance view)
+    • VM extension and agent health
+    • Load Balancers (frontend and backend configuration topology)
+
+    This hybrid model enables high performance, tenant-wide discovery via ARG,
+    while preserving accuracy for runtime and platform-specific details via ARM.
+
 
     Inventory is collected per tenant, across all enabled subscriptions, and exported
     as normalized CSV files into a single timestamped output folder.
 
     RESOURCE COVERAGE:
-      • Virtual Machines
-          - Power state, OS name/version
-          - SKU (vCPU / Memory via cached SKU index)
-          - Availability Zone / Set
-          - NIC, subnet, private IP mapping
-          - VM Agent, Azure Monitor Agent, MDE health
-          - Managed & unmanaged disk sizing
-          - Full raw tag capture with global normalization
-      • Network Security Groups
-          - Rules and effective NIC / subnet associations
-      • Virtual Networks
-          - Address spaces, subnets, NSG and route table references
-      • Public IP Addresses
-          - Allocation method, SKU, FQDN, NIC or NAT Gateway association
-      • Load Balancers
-          - Frontend IPs (public/private) and backend pools
+    • Virtual Machines
+        - Power state and OS name/version (ARG where available; ARM for full fidelity)
+        - SKU (vCPU / Memory via cached SKU index)
+        - Availability Zone / Set
+        - NIC, subnet, and private IP mapping (ARG-based)
+        - VM Agent, Azure Monitor Agent, MDE health (ARM augmentation)
+        - Managed & unmanaged disk sizing (ARG-based)
+        - Full raw tag capture with global normalization
 
+    • Network Security Groups
+        - Security rules (one rule per row)
+        - NIC and subnet associations (resolved via ARG NIC graph)
+        - VM and IP correlation via NIC relationships (ARG-based)
+
+    • Virtual Networks
+        - Address spaces and subnets
+        - NSG and route table references
+
+    • Public IP Addresses
+        - Allocation method, SKU, and FQDN
+        - NIC and NAT Gateway association (ARG-based resolution)
+
+    • Load Balancers
+        - Frontend IPs (public and private)
+        - Backend address pools
+        - Backend NIC, VM, and private IP correlation (ARG-enriched)
+        - Support for both NIC-based and IP-based backend configurations
+
+    • Orphaned Resources
+        - Managed Disks
+            - Unattached disks identified via ARG (state, ownership, and age thresholds)
+        - Network Interfaces
+            - NICs without VM, Private Endpoint, or managed association
+            - Includes resolved private/public IP and subnet context
+
+      
     TAG HANDLING:
       • All tag keys are discovered tenant-wide across all runs
       • Raw tag keys are preserved exactly (case and spacing)
@@ -50,14 +82,30 @@
 
 .OUTPUTS
     A single run output folder per execution containing:
-      • VM_<timestamp>.csv
-      • NSG_Custom_<timestamp>.csv
-      • vNet_<timestamp>.csv
-      • PIP_<timestamp>.csv
-      • LBe_<timestamp>.csv
 
-.PARAMETER None
-    This script is fully interactive.
+    • VM_<timestamp>.csv
+        - Comprehensive VM inventory including compute, storage, networking, tagging, and agent health
+
+    • NSG_Custom_<timestamp>.csv
+        - NSG rules (one rule per row) with NIC, VM, IP, and subnet associations
+
+    • vNet_<timestamp>.csv
+        - Virtual network and subnet configuration with NSG and route table references
+
+    • PIP_<timestamp>.csv
+        - Public IP inventory with allocation method, SKU, FQDN, and association details
+
+    • LBe_<timestamp>.csv
+        - Load Balancer inventory including frontend IPs, backend pools, and backend NIC, VM, and private IP correlation
+
+    • Orphan_Disk_<timestamp>.csv
+        - Unattached managed disks identified via ARG-based ownership and state analysis
+
+    • Orphan_NIC_<timestamp>.csv
+        - Network interfaces without VM, Private Endpoint, or managed association, including IP and subnet context
+
+.PARAMETER * Tenant ID and type are prompted interactively
+    -NoARM switch enables ARG-only inventory mode (no ARM augmentation)
 
 .INTERACTIVE PROMPTS
     • Tenant ID
@@ -66,7 +114,7 @@
 
 .NOTES
     AUTHOR:   Mark Lehrmann
-    VERSION:  v7.5.0 (2026-03-13)
+    VERSION:  v7.6.0 (2026-06-24)
 
     RUNBOOK:
       v6.1 – last automation-tested version (pre multi-tenant refactor)
@@ -93,7 +141,7 @@
 
 .TODO
     [ ] Add subnet delegation
-    [ ] Replace remaining ARM networking calls with ARG where possible
+    [x] Replace remaining ARM networking calls with ARG where possible
     [ ] JSON config file support (non-interactive mode)
     [ ] Subscription / Resource Group scoping parameters
     [ ] Inventory exclusions (by subscription or RG)
@@ -112,6 +160,50 @@ param(
     [switch]$NoARM
 )
 
+# Get absolute start time
+$ScriptStartTime = Get-Date
+
+Write-Host (
+    "Script started: {0}" -f
+    $ScriptStartTime.ToString('yyyy-MM-dd HH:mm:ss')
+) -ForegroundColor DarkGray
+
+# Load the query definitions from the external file
+$queryFile = Join-Path $PSScriptRoot 'Ex-Az_Inventory_multitenant.queries.ps1'
+
+if (-not (Test-Path $queryFile)) {
+    throw "Query definition file not found: $queryFile"
+}
+
+. $queryFile
+
+$requiredQueries = @(
+    'VM_BASE_QUERY',
+    'NIC_QUERY',
+    'DISK_QUERY',
+    'VNET_QUERY',
+    'PIP_QUERY',
+    'NSG_QUERY'
+)
+
+foreach ($query in $requiredQueries) {
+
+    $var = Get-Variable -Name $query -Scope Global -ErrorAction SilentlyContinue
+
+    if (-not $var) {
+        throw "Required query '$query' was not defined by $queryFile"
+    }
+
+    if ([string]::IsNullOrWhiteSpace([string]$var.Value)) {
+        throw "Required query '$query' is defined but empty in $queryFile"
+    }
+}
+
+Write-Host (
+    "Loaded {0} query definitions from {1}" -f
+    $requiredQueries.Count,
+    (Split-Path $queryFile -Leaf)
+) -ForegroundColor DarkGreen
 
 #################################
 #endregion Parameters
@@ -627,15 +719,22 @@ $runStampText = (Get-Date).ToString('yyyyMMdd_HHmm')
 $CSV_VM_name = 'VM_'
 
 # Initialize inventory mode based on the presence of the NoARM switch
-$InventoryMode = if ($NoARM.IsPresent) {
-    'NoARM / ARG-only inventory mode'
+if ($NoARM.IsPresent) {
+
+    $InventoryMode = 'NoARM / ARG-only (⚠️ Incomplete data possible)'
+
+    Write-Host ("Inventory mode: {0}" -f $InventoryMode) -ForegroundColor Yellow
+
+    Write-Host "⚠️  ARG-only mode: VM power state, PIPs, and some resources may be missing or reported as Unknown." -ForegroundColor DarkYellow
+
 }
 else {
-    'Full inventory mode / ARG + targeted ARM augmentation'
+
+    $InventoryMode = 'Full inventory mode / ARG + targeted ARM augmentation'
+
+    Write-Host ("Inventory mode: {0}" -f $InventoryMode) -ForegroundColor Cyan
+
 }
-
-Write-Host ("Inventory mode: {0}" -f $InventoryMode) -ForegroundColor Cyan
-
 
 # Subscription concurrency (adjust based on scale and testing)
 if (-not (Get-Variable -Name MaxConcurrency -Scope Script -ErrorAction SilentlyContinue)) {
@@ -756,648 +855,302 @@ do {
     #################################
     #endregion Tenant Init and Start
 
-    #region Queries
+    <#
+#region Queries
+#################################
+See Ex-Az_Inventory_multitenant.queries.ps1 for the ARG query definitions used in this script.
+#################################
+#endregion Queries
+#>
+
+    #region Tenant Init and Start
     #################################
-    
-    if ($subIds.Count -gt 0) {
-        $VM_BASE_QUERY = @'
-let diskInventory =
-    Resources
-    | where type =~ "microsoft.compute/disks"
-    | extend
-        diskId              = tolower(id),
-        diskSizeGB          = toint(properties.diskSizeGB),
-        diskAccessId        = tostring(properties.diskAccessId),
-        diskTimeCreated     = todatetime(properties.timeCreated),
-        diskState           = tostring(properties.diskState),
-        diskSkuName         = tostring(sku.name),
-        diskOsType          = tostring(properties.osType)
-    | project
-        diskId,
-        diskSizeGB,
-        diskAccessId,
-        diskTimeCreated,
-        diskState,
-        diskSkuName,
-        diskOsType;
-
-let vmCore =
-    Resources
-    | where type =~ "microsoft.compute/virtualmachines"
-    | extend
-        props                   = properties,
-        vmIdLower               = tolower(id),
-        vmSize                  = tostring(properties.hardwareProfile.vmSize),
-        timeCreated             = todatetime(properties.timeCreated),
-        availSetId              = tostring(properties.availabilitySet.id),
-        osType                  = tostring(properties.storageProfile.osDisk.osType),
-        osDiskManagedIdRaw      = tostring(properties.storageProfile.osDisk.managedDisk.id),
-        osDiskManagedIdLower    = tolower(tostring(properties.storageProfile.osDisk.managedDisk.id)),
-        osDiskName              = tostring(properties.storageProfile.osDisk.name),
-        osDiskVhdUri            = tostring(properties.storageProfile.osDisk.vhd.uri),
-        dataDisks               = properties.storageProfile.dataDisks,
-        imagePub                = tostring(properties.storageProfile.imageReference.publisher),
-        imageOffer              = tostring(properties.storageProfile.imageReference.offer),
-        imageSku                = tostring(properties.storageProfile.imageReference.sku),
-        imageVersion            = tostring(properties.storageProfile.imageReference.version),
-        adminUser               = tostring(properties.osProfile.adminUsername),
-        computerName            = tostring(properties.osProfile.computerName),
-        nicRefs                 = properties.networkProfile.networkInterfaces,
-        licenseType             = iif(isempty(tostring(properties.licenseType)), "NA", tostring(properties.licenseType)),
-        argPowerState           = tostring(properties.extended.instanceView.powerState.displayStatus),
-        argPowerStateCode       = tostring(properties.extended.instanceView.powerState.code),
-        argOSName               = tostring(properties.extended.instanceView.osName),
-        argOSVersion            = tostring(properties.extended.instanceView.osVersion),
-        argHyperVGeneration     = tostring(properties.extended.instanceView.hyperVGeneration)
-    | lookup kind=leftouter diskInventory on $left.osDiskManagedIdLower == $right.diskId
-    | project
-        id,
-        vmIdLower,
-        subscriptionId,
-        resourceGroup,
-        name,
-        location,
-        zones,
-        tags,
-        licenseType,
-        vmSize,
-        timeCreated,
-        availSetId,
-        osType,
-        osDiskManagedId = osDiskManagedIdRaw,
-        osDiskName,
-        osDiskVhdUri,
-        dataDisks,
-        imagePub,
-        imageOffer,
-        imageSku,
-        imageVersion,
-        adminUser,
-        computerName,
-        nicRefs,
-        argPowerState,
-        argPowerStateCode,
-        argOSName,
-        argOSVersion,
-        argHyperVGeneration,
-        osDiskSizeGB = diskSizeGB,
-        osDiskAccessId = diskAccessId,
-        osDiskTimeCreated = diskTimeCreated,
-        osDiskState = diskState,
-        osDiskSkuName = diskSkuName;
-
-let vmDataDiskRefs =
-    Resources
-    | where type =~ "microsoft.compute/virtualmachines"
-    | extend vmIdLower = tolower(id)
-    | extend dataDisks = properties.storageProfile.dataDisks
-    | mv-expand dataDisk = dataDisks to typeof(dynamic)
-    | extend
-        dataDiskName       = tostring(dataDisk.name),
-        dataDiskManagedId  = tostring(dataDisk.managedDisk.id),
-        dataDiskIdLower    = tolower(tostring(dataDisk.managedDisk.id)),
-        dataDiskLun        = tostring(dataDisk.lun),
-        dataDiskCaching    = tostring(dataDisk.caching),
-        dataDiskCreateOpt  = tostring(dataDisk.createOption)
-    | lookup kind=leftouter diskInventory on $left.dataDiskIdLower == $right.diskId
-    | summarize
-        DataDiskNames_ARG          = make_set(dataDiskName, 1000),
-        DataDiskIds_ARG            = make_set(dataDiskManagedId, 1000),
-        DataDiskLuns_ARG           = make_set(dataDiskLun, 1000),
-        DataDiskCaching_ARG        = make_set(dataDiskCaching, 1000),
-        DataDiskCreateOptions_ARG  = make_set(dataDiskCreateOpt, 1000),
-        DataDiskSkuNames_ARG       = make_set(diskSkuName, 1000),
-        DataDiskSizeGB_ARG         = sum(tolong(coalesce(diskSizeGB, 0)))
-      by vmIdLower;
-
-let nicIpInventory =
-    Resources
-    | where type =~ "microsoft.network/networkinterfaces"
-    | extend
-        nicIdLower          = tolower(id),
-        nicName             = tostring(name),
-        nicLocation         = tostring(location),
-        nicResourceGroup    = tostring(resourceGroup),
-        nicVmIdLower        = tolower(tostring(properties.virtualMachine.id)),
-        nicNsgId            = tostring(properties.networkSecurityGroup.id),
-        privateEndpointId   = tostring(properties.privateEndpoint.id),
-        managedById         = tostring(managedBy),
-        ipConfigs           = properties.ipConfigurations
-    | mv-expand ipConfig = ipConfigs to typeof(dynamic)
-    | extend
-        ipConfigName        = tostring(ipConfig.name),
-        privateIp           = tostring(ipConfig.properties.privateIPAddress),
-        privateIpAlloc      = tostring(ipConfig.properties.privateIPAllocationMethod),
-        privateIpVersion    = tostring(ipConfig.properties.privateIPAddressVersion),
-        subnetId            = tostring(ipConfig.properties.subnet.id),
-        publicIpId          = tostring(ipConfig.properties.publicIPAddress.id),
-        primaryIpConfig     = tostring(ipConfig.properties.primary),
-        vNetName            = extract(@"/virtualNetworks/([^/]+)/", 1, tostring(ipConfig.properties.subnet.id)),
-        subnetName          = extract(@"/subnets/([^/]+)$", 1, tostring(ipConfig.properties.subnet.id))
-    | where isnotempty(nicVmIdLower)
-    | summarize
-        ifName_ARG             = make_set(nicName, 1000),
-        ifId_ARG               = make_set(nicIdLower, 1000),
-        vNet_ARG               = make_set(vNetName, 1000),
-        Subnet_ARG             = make_set(subnetName, 1000),
-        SubnetId_ARG           = make_set(subnetId, 1000),
-        PrivateIP_ARG          = make_set(privateIp, 1000),
-        PrivateIPalloc_ARG     = make_set(privateIpAlloc, 1000),
-        PrivateIPVersion_ARG   = make_set(privateIpVersion, 1000),
-        PublicIPId_ARG         = make_set(publicIpId, 1000),
-        NIC_NSG_Id_ARG         = make_set(nicNsgId, 1000),
-        IPConfigName_ARG       = make_set(ipConfigName, 1000),
-        PrimaryIPConfig_ARG    = make_set(primaryIpConfig, 1000)
-      by vmIdLower = nicVmIdLower;
-
-let vmExtensions =
-    Resources
-    | where type =~ "microsoft.compute/virtualmachines/extensions"
-    | extend
-        vmIdLower              = tolower(tostring(split(id, "/extensions/")[0])),
-        extensionName          = tostring(name),
-        extensionPublisher     = tostring(properties.publisher),
-        extensionType          = tostring(properties.type),
-        extensionTypeVersion   = tostring(properties.typeHandlerVersion),
-        extensionAutoUpgrade   = tostring(properties.autoUpgradeMinorVersion),
-        extensionProvisioning  = tostring(properties.provisioningState),
-        extensionProbe         = strcat(
-                                    tostring(name), " ",
-                                    tostring(properties.publisher), " ",
-                                    tostring(properties.type)
-                                 )
-    | extend
-        isAMA = extensionProbe has_cs "AzureMonitorWindowsAgent"
-                or extensionProbe has_cs "AzureMonitorLinuxAgent"
-                or extensionProbe has_cs "Microsoft.Azure.Monitor"
-                or extensionProbe has_cs "AzureMonitor"
-                or extensionProbe has_cs "OmsAgentForLinux"
-                or extensionProbe has_cs "MicrosoftMonitoringAgent"
-                or extensionProbe has_cs "MMA"
-                or extensionProbe has_cs "OMS",
-        isMDE = extensionProbe has_cs "MDE"
-                or extensionProbe has_cs "Defender"
-                or extensionProbe has_cs "DefenderForEndpoint"
-                or extensionProbe has_cs "MicrosoftDefender"
-                or extensionProbe has_cs "Mdatp"
-                or extensionProbe has_cs "Microsoft.Azure.Security"
-                or extensionProbe has_cs "Endpoint"
-                or extensionProbe has_cs "ATP"
-                or extensionProbe has_cs "MicrosoftDefenderForEndpoint"
-                or extensionProbe has_cs "AzureSecurity"
-    | summarize
-        ExtensionNames_ARG              = make_set(extensionName, 1000),
-        ExtensionPublishers_ARG         = make_set(extensionPublisher, 1000),
-        ExtensionTypes_ARG              = make_set(extensionType, 1000),
-        ExtensionTypeVersions_ARG       = make_set(extensionTypeVersion, 1000),
-        ExtensionProvisioningStates_ARG = make_set(extensionProvisioning, 1000),
-        AMA_ExtensionNames_ARG          = make_set_if(extensionName, isAMA, 1000),
-        AMA_ProvisioningStates_ARG      = make_set_if(extensionProvisioning, isAMA, 1000),
-        MDE_ExtensionNames_ARG          = make_set_if(extensionName, isMDE, 1000),
-        MDE_ProvisioningStates_ARG      = make_set_if(extensionProvisioning, isMDE, 1000),
-        AMA_Count_ARG                   = countif(isAMA),
-        AMA_Succeeded_Count_ARG         = countif(isAMA and extensionProvisioning =~ "Succeeded"),
-        MDE_Count_ARG                   = countif(isMDE),
-        MDE_Succeeded_Count_ARG         = countif(isMDE and extensionProvisioning =~ "Succeeded")
-      by vmIdLower;
-
-vmCore
-| lookup kind=leftouter nicIpInventory on vmIdLower
-| lookup kind=leftouter vmDataDiskRefs on vmIdLower
-| lookup kind=leftouter vmExtensions on vmIdLower
-| extend
-    VMStatus_ARG = case(
-        isnotempty(argPowerState), argPowerState,
-        isnotempty(argPowerStateCode), argPowerStateCode,
-        "ARG:NotReported"
-    ),
-    VM_Agent_Status_ARG = case(
-        isnotempty(argOSName) or isnotempty(argOSVersion) or isnotempty(argPowerState), "ARG:InstanceViewPresent",
-        "ARG:NotAvailable"
-    ),
-    AzureMonitorAgent_ARG = case(
-        coalesce(AMA_Count_ARG, 0) == 0, "Not Installed",
-        coalesce(AMA_Succeeded_Count_ARG, 0) > 0, "Installed",
-        "Installed, Provisioning Not Succeeded"
-    ),
-    MDEAgent_ARG = case(
-        coalesce(MDE_Count_ARG, 0) == 0, "Not Installed",
-        coalesce(MDE_Succeeded_Count_ARG, 0) > 0, "Installed",
-        "Installed, Provisioning Not Succeeded"
-    ),
-    TotalManagedDiskSizeGB_ARG = tolong(coalesce(osDiskSizeGB, 0)) + tolong(coalesce(DataDiskSizeGB_ARG, 0)),
-    DataDiskNames_Text_ARG = strcat_array(DataDiskNames_ARG, ";"),
-    ifName_Text_ARG = strcat_array(ifName_ARG, ";"),
-    vNet_Text_ARG = strcat_array(vNet_ARG, ";"),
-    Subnet_Text_ARG = strcat_array(Subnet_ARG, ";"),
-    PrivateIP_Text_ARG = strcat_array(PrivateIP_ARG, ";"),
-    PrivateIPalloc_Text_ARG = strcat_array(PrivateIPalloc_ARG, ";"),
-    ExtensionNames_Text_ARG = strcat_array(ExtensionNames_ARG, ";"),
-    ExtensionTypes_Text_ARG = strcat_array(ExtensionTypes_ARG, ";")
-| project
-    id,
-    subscriptionId,
-    resourceGroup,
-    name,
-    location,
-    zones,
-    tags,
-    licenseType,
-    vmSize,
-    timeCreated,
-    availSetId,
-    osType,
-    osDiskManagedId,
-    osDiskName,
-    osDiskVhdUri,
-    dataDisks,
-    imagePub,
-    imageOffer,
-    imageSku,
-    imageVersion,
-    adminUser,
-    computerName,
-    nicRefs,
-
-    VMStatus_ARG,
-    VM_Agent_Status_ARG,
-    AzureMonitorAgent_ARG,
-    MDEAgent_ARG,
-    argPowerState,
-    argPowerStateCode,
-    argOSName,
-    argOSVersion,
-    argHyperVGeneration,
-
-    ifName_ARG = ifName_Text_ARG,
-    vNet_ARG = vNet_Text_ARG,
-    Subnet_ARG = Subnet_Text_ARG,
-    PrivateIP_ARG = PrivateIP_Text_ARG,
-    PrivateIPalloc_ARG = PrivateIPalloc_Text_ARG,
-
-    osDiskSizeGB,
-    osDiskAccessId,
-    osDiskTimeCreated,
-    osDiskState,
-    osDiskSkuName,
-    DataDiskNames_ARG = DataDiskNames_Text_ARG,
-    DataDiskSizeGB_ARG,
-    TotalManagedDiskSizeGB_ARG,
-
-    ExtensionNames_ARG = ExtensionNames_Text_ARG,
-    ExtensionTypes_ARG = ExtensionTypes_Text_ARG,
-    ExtensionProvisioningStates_ARG,
-    AMA_ExtensionNames_ARG,
-    AMA_ProvisioningStates_ARG,
-    MDE_ExtensionNames_ARG,
-    MDE_ProvisioningStates_ARG
-'@
-
-        $NIC_QUERY = @'
-Resources
-| where type =~ "microsoft.network/networkinterfaces"
-| extend
-    ipConfigs         = properties.ipConfigurations,
-    virtualMachineId  = tostring(properties.virtualMachine.id),
-    privateEndpointId = tostring(properties.privateEndpoint.id),
-    managedById       = tostring(managedBy)
-| project id, subscriptionId, resourceGroup, name, location,
-         ipConfigs, virtualMachineId, privateEndpointId, managedById
-'@
-
-        $DISK_QUERY = @'
-Resources
-| where type =~ "microsoft.compute/disks"
-| extend
-    diskSizeGB          = toint(properties.diskSizeGB),
-    diskAccessId        = tostring(properties.diskAccessId),
-    timeCreated         = todatetime(properties.timeCreated),
-    diskState           = tostring(properties.diskState),
-    managedById         = tostring(managedBy),
-    skuName             = tostring(sku.name),
-    osType              = tostring(properties.osType),
-    lastOwnershipUpdate = todatetime(properties.LastOwnershipUpdateTime)
-| project id, subscriptionId, resourceGroup, name, location,
-         diskSizeGB, diskAccessId, timeCreated,
-         diskState, managedById, skuName, osType, lastOwnershipUpdate
-'@
-
-        $VNET_QUERY = @'
-Resources
-| where type =~ "microsoft.network/virtualnetworks"
-| extend subnets = parse_json(properties.subnets)
-| mv-expand subnet = subnets
-| extend addressPrefixArray = subnet.properties.addressPrefixes
-| extend Subnet_Address = iif(
-    isnull(addressPrefixArray),
-    tostring(subnet.properties.addressPrefix),
-    strcat_array(addressPrefixArray, " ")
-)
-| project
-    id,
-    subscriptionId,
-    resourceGroup,
-    name,
-    location,
-    vNet_Addresses = strcat_array(properties.addressSpace.addressPrefixes, " "),
-    vNet_DNS       = strcat_array(properties.dhcpOptions.dnsServers, " "),
-    Subnet_Name    = subnet.name,
-    Subnet_Address,
-    Subnet_NSG_Id  = tostring(subnet.properties.networkSecurityGroup.id),
-    Route_Table_Id = tostring(subnet.properties.routeTable.id),
-    vNet_Peers     = array_length(properties.virtualNetworkPeerings)
-'@
-
-        $PIP_QUERY = @'
-Resources
-| where type =~ "microsoft.network/publicipaddresses"
-| project
-    id, subscriptionId, resourceGroup, name, location,
-    PublicIpAddress   = tostring(properties.ipAddress),
-    AllocationMethod  = tostring(properties.publicIPAllocationMethod),
-    SkuName           = tostring(sku.name),
-    SkuTier           = tostring(sku.tier),
-    Fqdn              = coalesce(tostring(properties.dnsSettings.fqdn), ""),
-    IpConfigId        = tostring(properties.ipConfiguration.id),
-    NatGatewayId      = tostring(properties.natGateway.id)
-'@
-        #################################
-        #endregion Querie
-
-        #region Tenant Init and Start
-        #################################
         
-        try {
-            # --- ARG VM discovery ---
-            $vmRowsArg = Get-AllAzGraph -Query $VM_BASE_QUERY -SubscriptionId $subIds -BatchSize 1000
+    try {
+        # --- ARG VM discovery ---
+        Write-Host "ARG: Running VM query..." -ForegroundColor Cyan
+        $vmRowsArg = Get-AllAzGraph -Query $VM_BASE_QUERY -SubscriptionId $subIds -BatchSize 1000
 
-            # --- Determine environment key (per tenant) ---
-            $envKey = if ($CommercialTenant) { 'Public' } else { 'Gov' }
 
-            # --- Build per-tenant SKU index ---
-            # In NoARM mode, skip Get-AzComputeResourceSku because it is an ARM/Compute API call.
-            $skuIndex = @{}
+        # --- Determine environment key (per tenant) ---
+        $envKey = if ($CommercialTenant) { 'Public' } else { 'Gov' }
 
-            if ($NoARM.IsPresent) {
-                Write-Host "NoARM mode: skipping Compute SKU lookup. SKUvcpu, vCPUs, and MemoryGB will be marked as Skipped." -ForegroundColor Yellow
-            }
-            else {
-                # Ensure Az.Compute is available (required for Get-AzComputeResourceSku)
-                try { Import-Module Az.Compute -ErrorAction Stop | Out-Null } catch { }
+        # --- Build per-tenant SKU index ---
+        # In NoARM mode, skip Get-AzComputeResourceSku because it is an ARM/Compute API call.
+        $skuIndex = @{}
 
-                # --- Discover VM regions used by this tenant ---
-                $tenantRegions = $vmRowsArg |
-                Where-Object { $_.location } |
-                ForEach-Object { $_.location.ToLowerInvariant() } |
-                Sort-Object -Unique
+        if ($NoARM.IsPresent) {
+            Write-Host "NoARM mode: skipping Compute SKU lookup. SKUvcpu, vCPUs, and MemoryGB will be marked as Skipped." -ForegroundColor Yellow
+        }
+        else {
+            # Ensure Az.Compute is available (required for Get-AzComputeResourceSku)
+            try { Import-Module Az.Compute -ErrorAction Stop | Out-Null } catch { }
 
-                # --- Populate SKU cache (per run, per environment, additive) ---
-                foreach ($region in $tenantRegions) {
-                    if (-not $script:SkuCache[$envKey].Regions.ContainsKey($region)) {
+            # --- Discover VM regions used by this tenant ---
+            $tenantRegions = $vmRowsArg |
+            Where-Object { $_.location } |
+            ForEach-Object { $_.location.ToLowerInvariant() } |
+            Sort-Object -Unique
 
-                        Write-Host ("Fetching SKU data for {0} region '{1}'" -f $envKey, $region) -ForegroundColor Cyan
+            # --- Populate SKU cache (per run, per environment, additive) ---
+            foreach ($region in $tenantRegions) {
+                if (-not $script:SkuCache[$envKey].Regions.ContainsKey($region)) {
 
-                        try {
-                            $skuData = Get-AzComputeResourceSku -Location $region -ErrorAction Stop
-
-                            $script:SkuCache[$envKey].Regions[$region] = $true
-
-                            foreach ($s in @($skuData)) {
-                                $script:SkuCache[$envKey].Skus.Add($s) | Out-Null
-                            }
-                        }
-                        catch {
-                            Write-Warning ("SKU lookup failed for {0} region '{1}': {2}" -f $envKey, $region, $_.Exception.Message)
-                        }
-                    }
-                }
-
-                foreach ($s in @($script:SkuCache[$envKey].Skus)) {
-                    if (-not $s -or $s.ResourceType -ne 'virtualMachines') { continue }
-
-                    foreach ($loc in @($s.Locations)) {
-                        if (-not $loc) { continue }
-
-                        $key = '{0}|{1}' -f $s.Name, $loc.ToLowerInvariant()
-                        if (-not $skuIndex.ContainsKey($key)) {
-                            $skuIndex[$key] = $s
-                        }
-                    }
-                }
-
-                Write-Host (
-                    "SKU cache status: Env={0}, RegionsCached={1}, SKUsCached={2}, IndexKeys={3}" -f
-                    $envKey,
-                    $script:SkuCache[$envKey].Regions.Count,
-                    $script:SkuCache[$envKey].Skus.Count,
-                    $skuIndex.Count
-                ) -ForegroundColor DarkGreen
-            }
-
-            # --- Remaining ARG collections ---
-            $nicRowsArg = Get-AllAzGraph -Query $NIC_QUERY  -SubscriptionId $subIds -BatchSize 1000
-            $diskRowsArg = Get-AllAzGraph -Query $DISK_QUERY -SubscriptionId $subIds -BatchSize 1000
-            $vNetRows = Get-AllAzGraph -Query $VNET_QUERY -SubscriptionId $subIds -BatchSize 1000
-            $pipRows = Get-AllAzGraph -Query $PIP_QUERY  -SubscriptionId $subIds -BatchSize 1000
-
-            Write-Host ("ARG: VMs={0} NICs={1} Disks={2} VNets={3} PIPs={4}" -f
-                $vmRowsArg.Count, $nicRowsArg.Count, $diskRowsArg.Count,
-                $vNetRows.Count, $pipRows.Count) -ForegroundColor Green
-
-            foreach ($n in $nicRowsArg) { if ($n.id) { $nicIndexById[$n.id] = $n } }
-            foreach ($d in $diskRowsArg) { if ($d.id) { $diskIndexById[$d.id] = $d } }
-
-            foreach ($vm in $vmRowsArg) {
-                if ($vm.id) {
-                    $vmIndexById[$vm.id] = $vm
-                    $vmNameById[$vm.id] = $vm.name
-                }
-
-                if ($vm.tags) {
-                    foreach ($p in $vm.tags.PSObject.Properties) {
-                        $rawKey = [string]$p.Name
-                        if (-not [string]::IsNullOrWhiteSpace($rawKey)) {
-                            $null = $globalTagKeysRaw.Add($rawKey)
-                        }
-                    }
-                }
-
-                if (-not $vmsBySubscription.ContainsKey($vm.subscriptionId)) {
-                    $vmsBySubscription[$vm.subscriptionId] = [System.Collections.Generic.List[object]]::new()
-                }
-                $vmsBySubscription[$vm.subscriptionId].Add($vm)
-            }
-
-            Write-Host ("ARG: Total discovered tag headers (global): {0}" -f $globalTagKeysRaw.Count) -ForegroundColor DarkGreen
-            Write-Host ("ARG: Subscription VM buckets: {0}" -f $vmsBySubscription.Keys.Count) -ForegroundColor DarkGreen
-            #################################
-            #endregion Tenant Init and Start
-
-            #region Orphaned Managed Disks / NICs (ARG reuse)
-            #################################            
-            try {
-                
-
-                # Build PIP lookup by Public IP resource ID for orphan NIC resolution
-                $pipArgById = @{}
-                foreach ($p in @($pipRows)) {
-                    if ($p.id) { $pipArgById[[string]$p.id] = $p }
-                }
-
-                # --- Orphaned Managed Disks ---
-                $orphanDiskCutoff = (Get-Date).AddHours(-24)
-
-                foreach ($disk in @($diskRowsArg)) {
-                    if (-not $disk) { continue }
-
-                    $diskState = [string]$disk.diskState
-                    $managedById = [string]$disk.managedById
-                    $diskName = [string]$disk.name
-                    $lastOwnershipUpdate = $null
+                    Write-Host ("Fetching SKU data for {0} region '{1}'" -f $envKey, $region) -ForegroundColor Cyan
 
                     try {
-                        if ($disk.lastOwnershipUpdate) {
-                            $lastOwnershipUpdate = [datetime]$disk.lastOwnershipUpdate
+                        $skuData = Get-AzComputeResourceSku -Location $region -ErrorAction Stop
+
+                        $script:SkuCache[$envKey].Regions[$region] = $true
+
+                        foreach ($s in @($skuData)) {
+                            $script:SkuCache[$envKey].Skus.Add($s) | Out-Null
                         }
                     }
-                    catch { }
+                    catch {
+                        Write-Warning ("SKU lookup failed for {0} region '{1}': {2}" -f $envKey, $region, $_.Exception.Message)
+                    }
+                }
+            }
 
-                    $isOrphanManagedDisk =
-                    ($diskState -ieq 'Unattached') -and
-                    [string]::IsNullOrWhiteSpace($managedById) -and
-                    ($null -eq $lastOwnershipUpdate -or $lastOwnershipUpdate -lt $orphanDiskCutoff) -and
-                    (-not ($diskName -like '*-ASRReplica'))
+            foreach ($s in @($script:SkuCache[$envKey].Skus)) {
+                if (-not $s -or $s.ResourceType -ne 'virtualMachines') { continue }
 
-                    if (-not $isOrphanManagedDisk) { continue }
+                foreach ($loc in @($s.Locations)) {
+                    if (-not $loc) { continue }
 
-                    $subId = [string]$disk.subscriptionId
-                    $subName = if ($subscriptionNameById.ContainsKey($subId)) { $subscriptionNameById[$subId] } else { $subId }
+                    $key = '{0}|{1}' -f $s.Name, $loc.ToLowerInvariant()
+                    if (-not $skuIndex.ContainsKey($key)) {
+                        $skuIndex[$key] = $s
+                    }
+                }
+            }
 
-                    $AzOrphanDisk_Inventory.Add([pscustomobject]@{
-                            TenantDomain            = $TenantDomain
-                            SubscriptionName        = $subName
-                            ResourceGroupName       = $disk.resourceGroup
-                            Location                = $disk.location
-                            DiskName                = $disk.name
-                            DiskType                = $disk.skuName
-                            OSType                  = $disk.osType
-                            DiskSizeGB              = $disk.diskSizeGB
-                            TimeCreated             = if ($disk.timeCreated) { ([datetime]$disk.timeCreated).ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ') } else { $null }
-                            LastOwnershipUpdateTime = if ($disk.lastOwnershipUpdate) { ([datetime]$disk.lastOwnershipUpdate).ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ') } else { $null }
-                            DiskId                  = $disk.id
-                        })
+            Write-Host (
+                "SKU cache status: Env={0}, RegionsCached={1}, SKUsCached={2}, IndexKeys={3}" -f
+                $envKey,
+                $script:SkuCache[$envKey].Regions.Count,
+                $script:SkuCache[$envKey].Skus.Count,
+                $skuIndex.Count
+            ) -ForegroundColor DarkGreen
+        }
+
+        # --- Remaining ARG collections ---
+        Write-Host "ARG: Running NIC query..." -ForegroundColor Cyan
+        $nicRowsArg = Get-AllAzGraph -Query $NIC_QUERY -SubscriptionId $subIds -BatchSize 1000
+
+        Write-Host "ARG: Running Disk query..." -ForegroundColor Cyan
+        $diskRowsArg = Get-AllAzGraph -Query $DISK_QUERY -SubscriptionId $subIds -BatchSize 1000
+            
+        Write-Host "ARG: Running NSG query..." -ForegroundColor Cyan
+        $nsgRowsArg = Get-AllAzGraph -Query $NSG_QUERY -SubscriptionId $subIds -BatchSize 1000
+
+        Write-Host "ARG: Running vNet query..." -ForegroundColor Cyan
+        $vNetRows = Get-AllAzGraph -Query $VNET_QUERY -SubscriptionId $subIds -BatchSize 1000
+
+        Write-Host "ARG: Running Public IP query..." -ForegroundColor Cyan
+        $pipRows = Get-AllAzGraph -Query $PIP_QUERY -SubscriptionId $subIds -BatchSize 1000
+
+            
+        $pipArgById = @{}
+        foreach ($p in @($pipRows)) {
+            if ($p.id) { $pipArgById[[string]$p.id] = $p }
+        }
+
+        Write-Host ("ARG: VMs={0} NICs={1} Disks={2} VNets={3} PIPs={4}" -f
+            $vmRowsArg.Count, $nicRowsArg.Count, $diskRowsArg.Count,
+            $vNetRows.Count, $pipRows.Count) -ForegroundColor Green
+
+        foreach ($n in $nicRowsArg) { if ($n.id) { $nicIndexById[$n.id] = $n } }
+        foreach ($d in $diskRowsArg) { if ($d.id) { $diskIndexById[$d.id] = $d } }
+
+        foreach ($vm in $vmRowsArg) {
+            if ($vm.id) {
+                $vmIndexById[$vm.id] = $vm
+                $vmNameById[$vm.id] = $vm.name
+            }
+
+            if ($vm.tags) {
+                foreach ($p in $vm.tags.PSObject.Properties) {
+                    $rawKey = [string]$p.Name
+                    if (-not [string]::IsNullOrWhiteSpace($rawKey)) {
+                        $null = $globalTagKeysRaw.Add($rawKey)
+                    }
+                }
+            }
+
+            if (-not $vmsBySubscription.ContainsKey($vm.subscriptionId)) {
+                $vmsBySubscription[$vm.subscriptionId] = [System.Collections.Generic.List[object]]::new()
+            }
+            $vmsBySubscription[$vm.subscriptionId].Add($vm)
+        }
+
+        Write-Host ("ARG: Total discovered tag headers (global): {0}" -f $globalTagKeysRaw.Count) -ForegroundColor DarkGreen
+        Write-Host ("ARG: Subscription VM buckets: {0}" -f $vmsBySubscription.Keys.Count) -ForegroundColor DarkGreen
+        #################################
+        #endregion Tenant Init and Start
+
+        #region Orphaned Managed Disks / NICs (ARG reuse)
+        #################################            
+        try {
+                
+
+            # Build PIP lookup by Public IP resource ID for orphan NIC resolution
+            $pipArgById = @{}
+            foreach ($p in @($pipRows)) {
+                if ($p.id) { $pipArgById[[string]$p.id] = $p }
+            }
+
+            # --- Orphaned Managed Disks ---
+            $orphanDiskCutoff = (Get-Date).AddHours(-24)
+
+            foreach ($disk in @($diskRowsArg)) {
+                if (-not $disk) { continue }
+
+                $diskState = [string]$disk.diskState
+                $managedById = [string]$disk.managedById
+                $diskName = [string]$disk.name
+                $lastOwnershipUpdate = $null
+
+                try {
+                    if ($disk.lastOwnershipUpdate) {
+                        $lastOwnershipUpdate = [datetime]$disk.lastOwnershipUpdate
+                    }
+                }
+                catch { }
+
+                $isOrphanManagedDisk =
+                ($diskState -ieq 'Unattached') -and
+                [string]::IsNullOrWhiteSpace($managedById) -and
+                ($null -eq $lastOwnershipUpdate -or $lastOwnershipUpdate -lt $orphanDiskCutoff) -and
+                (-not ($diskName -like '*-ASRReplica'))
+
+                if (-not $isOrphanManagedDisk) { continue }
+
+                $subId = [string]$disk.subscriptionId
+                $subName = if ($subscriptionNameById.ContainsKey($subId)) { $subscriptionNameById[$subId] } else { $subId }
+
+                $AzOrphanDisk_Inventory.Add([pscustomobject]@{
+                        TenantDomain            = $TenantDomain
+                        SubscriptionName        = $subName
+                        ResourceGroupName       = $disk.resourceGroup
+                        Location                = $disk.location
+                        DiskName                = $disk.name
+                        DiskType                = $disk.skuName
+                        OSType                  = $disk.osType
+                        DiskSizeGB              = $disk.diskSizeGB
+                        TimeCreated             = if ($disk.timeCreated) { ([datetime]$disk.timeCreated).ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ') } else { $null }
+                        LastOwnershipUpdateTime = if ($disk.lastOwnershipUpdate) { ([datetime]$disk.lastOwnershipUpdate).ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ') } else { $null }
+                        DiskId                  = $disk.id
+                    })
+            }
+
+            # --- Orphaned NICs ---
+            foreach ($nic in @($nicRowsArg)) {
+                if (-not $nic) { continue }
+
+                $virtualMachineId = [string]$nic.virtualMachineId
+                $privateEndpointId = [string]$nic.privateEndpointId
+                $managedById = [string]$nic.managedById
+
+                $isOrphanNic =
+                [string]::IsNullOrWhiteSpace($virtualMachineId) -and
+                [string]::IsNullOrWhiteSpace($privateEndpointId) -and
+                [string]::IsNullOrWhiteSpace($managedById)
+
+                if (-not $isOrphanNic) { continue }
+
+                $primaryIpConfig = $null
+                $ipConfigs = @($nic.ipConfigs)
+
+                if ($ipConfigs.Count -gt 0) {
+                    $primaryIpConfig = $ipConfigs | Where-Object { $_.properties.primary -eq $true } | Select-Object -First 1
+                    if (-not $primaryIpConfig) {
+                        $primaryIpConfig = $ipConfigs | Select-Object -First 1
+                    }
                 }
 
-                # --- Orphaned NICs ---
-                foreach ($nic in @($nicRowsArg)) {
-                    if (-not $nic) { continue }
+                $privateIp = 'na'
+                $publicIp = 'na'
+                $vnetName = 'na'
+                $subnetName = 'na'
 
-                    $virtualMachineId = [string]$nic.virtualMachineId
-                    $privateEndpointId = [string]$nic.privateEndpointId
-                    $managedById = [string]$nic.managedById
-
-                    $isOrphanNic =
-                    [string]::IsNullOrWhiteSpace($virtualMachineId) -and
-                    [string]::IsNullOrWhiteSpace($privateEndpointId) -and
-                    [string]::IsNullOrWhiteSpace($managedById)
-
-                    if (-not $isOrphanNic) { continue }
-
-                    $primaryIpConfig = $null
-                    $ipConfigs = @($nic.ipConfigs)
-
-                    if ($ipConfigs.Count -gt 0) {
-                        $primaryIpConfig = $ipConfigs | Where-Object { $_.properties.primary -eq $true } | Select-Object -First 1
-                        if (-not $primaryIpConfig) {
-                            $primaryIpConfig = $ipConfigs | Select-Object -First 1
-                        }
+                if ($primaryIpConfig) {
+                    if ($primaryIpConfig.properties.privateIPAddress) {
+                        $privateIp = [string]$primaryIpConfig.properties.privateIPAddress
                     }
 
-                    $privateIp = 'na'
-                    $publicIp = 'na'
-                    $vnetName = 'na'
-                    $subnetName = 'na'
-
-                    if ($primaryIpConfig) {
-                        if ($primaryIpConfig.properties.privateIPAddress) {
-                            $privateIp = [string]$primaryIpConfig.properties.privateIPAddress
-                        }
-
-                        $subnetId = $null
-                        if ($primaryIpConfig.properties.subnet -and $primaryIpConfig.properties.subnet.id) {
-                            $subnetId = [string]$primaryIpConfig.properties.subnet.id
-                        }
-
-                        if (-not [string]::IsNullOrWhiteSpace($subnetId)) {
-                            $vnetResolved = Get-IdSegment -Id $subnetId -SegmentName 'virtualNetworks'
-                            $subnetResolved = Get-IdSegment -Id $subnetId -SegmentName 'subnets'
-
-                            if ($vnetResolved) { $vnetName = $vnetResolved }
-                            if ($subnetResolved) { $subnetName = $subnetResolved }
-                        }
-
-                        $publicIpId = $null
-                        if ($primaryIpConfig.properties.publicIPAddress -and $primaryIpConfig.properties.publicIPAddress.id) {
-                            $publicIpId = [string]$primaryIpConfig.properties.publicIPAddress.id
-                        }
-
-                        if ($publicIpId -and $pipArgById.ContainsKey($publicIpId)) {
-                            $resolvedPip = $pipArgById[$publicIpId]
-                            if ($resolvedPip.PublicIpAddress) {
-                                $publicIp = [string]$resolvedPip.PublicIpAddress
-                            }
-                        }
+                    $subnetId = $null
+                    if ($primaryIpConfig.properties.subnet -and $primaryIpConfig.properties.subnet.id) {
+                        $subnetId = [string]$primaryIpConfig.properties.subnet.id
                     }
 
-                    $subId = [string]$nic.subscriptionId
-                    $subName = if ($subscriptionNameById.ContainsKey($subId)) { $subscriptionNameById[$subId] } else { $subId }
+                    if (-not [string]::IsNullOrWhiteSpace($subnetId)) {
+                        $vnetResolved = Get-IdSegment -Id $subnetId -SegmentName 'virtualNetworks'
+                        $subnetResolved = Get-IdSegment -Id $subnetId -SegmentName 'subnets'
 
-                    $AzOrphanNIC_Inventory.Add([pscustomobject]@{
-                            TenantDomain      = $TenantDomain
-                            SubscriptionName  = $subName
-                            ResourceGroupName = $nic.resourceGroup
-                            Location          = $nic.location
-                            NICName           = $nic.name
-                            PrivateIP         = $privateIp
-                            PublicIP          = $publicIp
-                            VirtualNetwork    = $vnetName
-                            Subnet            = $subnetName
-                            NICId             = $nic.id
-                        })
+                        if ($vnetResolved) { $vnetName = $vnetResolved }
+                        if ($subnetResolved) { $subnetName = $subnetResolved }
+                    }
+
+                    $publicIpId = $null
+                    if ($primaryIpConfig.properties.publicIPAddress -and $primaryIpConfig.properties.publicIPAddress.id) {
+                        $publicIpId = [string]$primaryIpConfig.properties.publicIPAddress.id
+                    }
+
+                    if ($publicIpId -and $pipArgById.ContainsKey($publicIpId)) {
+                        $resolvedPip = $pipArgById[$publicIpId]
+                        if ($resolvedPip.PublicIpAddress) {
+                            $publicIp = [string]$resolvedPip.PublicIpAddress
+                        }
+                    }
                 }
 
-                Write-Host ("ARG: Orphaned Managed Disks={0} Orphaned NICs={1}" -f
-                    $AzOrphanDisk_Inventory.Count, $AzOrphanNIC_Inventory.Count) -ForegroundColor DarkGreen
+                $subId = [string]$nic.subscriptionId
+                $subName = if ($subscriptionNameById.ContainsKey($subId)) { $subscriptionNameById[$subId] } else { $subId }
 
+                $AzOrphanNIC_Inventory.Add([pscustomobject]@{
+                        TenantDomain      = $TenantDomain
+                        SubscriptionName  = $subName
+                        ResourceGroupName = $nic.resourceGroup
+                        Location          = $nic.location
+                        NICName           = $nic.name
+                        PrivateIP         = $privateIp
+                        PublicIP          = $publicIp
+                        VirtualNetwork    = $vnetName
+                        Subnet            = $subnetName
+                        NICId             = $nic.id
+                    })
             }
-            catch {
-                Write-Warning ("Orphan ARG reuse block failed: {0}" -f $_.Exception.Message)
-                $AzOrphanDisk_Inventory = [System.Collections.Generic.List[object]]::new()
-                $AzOrphanNIC_Inventory = [System.Collections.Generic.List[object]]::new()
-            }
+
+            Write-Host ("ARG: Orphaned Managed Disks={0} Orphaned NICs={1}" -f
+                $AzOrphanDisk_Inventory.Count, $AzOrphanNIC_Inventory.Count) -ForegroundColor DarkGreen
+
         }
         catch {
-            Write-Warning ("ARG collection failed: {0}" -f $_.Exception.Message)
-            $vmsBySubscription = @{}
-            $vmIndexById = @{}
-            $vmNameById = @{}
-            $nicIndexById = @{}
-            $diskIndexById = @{}
-            $vNetRows = @()
-            $pipRows = @()
-
-            # Ensure these exist even on failure so downstream code doesn't blow up
-            $vmRowsArg = @()
-            $nicRowsArg = @()
-            $diskRowsArg = @()
-            $skuIndex = @{}
+            Write-Warning ("Orphan ARG reuse block failed: {0}" -f $_.Exception.Message)
+            $AzOrphanDisk_Inventory = [System.Collections.Generic.List[object]]::new()
+            $AzOrphanNIC_Inventory = [System.Collections.Generic.List[object]]::new()
         }
     }
-    else {
-        Write-Warning ("No subscriptions found for tenant {0}. VM inventory will be empty." -f $Tenant)
+    catch {
+        Write-Warning ("ARG collection failed: {0}" -f $_.Exception.Message)
+        $vmsBySubscription = @{}
+        $vmIndexById = @{}
+        $vmNameById = @{}
+        $nicIndexById = @{}
+        $diskIndexById = @{}
         $vNetRows = @()
         $pipRows = @()
+
+        # Ensure these exist even on failure so downstream code doesn't blow up
+        $vmRowsArg = @()
+        $nicRowsArg = @()
+        $diskRowsArg = @()
+        $skuIndex = @{}
     }
+
+    
     #################################
     #endregion Orphaned Managed Disks / NICs (ARG reuse)
 
@@ -1482,9 +1235,6 @@ Resources
             # Phase: Collect ARM resources unless NoARM mode is enabled
             Update-SubProgress -Phase "Preparing inventory collectors" -SubPercent 15
 
-            $azureNICDetails = @()
-            $azureNSGDetails = @()
-            $azurePublicIPs = @()
             $AzureLBList = @()
             $vmStatusList = @()
             $vmStatusIndexById = @{}
@@ -1498,9 +1248,6 @@ Resources
                 Update-SubProgress -Phase "Running collectors (NIC/NSG/PIP/LB/VM Status)" -SubPercent 15
 
                 $collectorJobs = @(
-                    @{ Name = 'NIC'; JobType = 'NIC'; SubscriptionId = $subscription_id },
-                    @{ Name = 'NSG'; JobType = 'NSG'; SubscriptionId = $subscription_id },
-                    @{ Name = 'PIP'; JobType = 'PIP'; SubscriptionId = $subscription_id },
                     @{ Name = 'LB'; JobType = 'LB'; SubscriptionId = $subscription_id },
                     @{ Name = 'VMSTATUS'; JobType = 'VMSTATUS'; SubscriptionId = $subscription_id }
                 )
@@ -1516,9 +1263,6 @@ Resources
                     }
 
                     switch ($r.Name) {
-                        'NIC' { $azureNICDetails = @($r.Data) }
-                        'NSG' { $azureNSGDetails = @($r.Data) }
-                        'PIP' { $azurePublicIPs = @($r.Data) }
                         'LB' { $AzureLBList = @($r.Data) }
                         'VMSTATUS' { $vmStatusList = @($r.Data) }
                     }
@@ -1585,8 +1329,8 @@ Resources
 
                     Update-SubProgress -Phase ("Extension health complete ({0}/{1})" -f $processed, $totalVms) -SubPercent 75
                 }
-
-
+                #################################
+                #endregion Subscription Loop
 
                 #region Virtual Machine Details (ARG-first)
                 #################################
@@ -1597,10 +1341,8 @@ Resources
 
                 foreach ($vm in $vmRowsSub) {
 
-                    ###########################################################################
+                    
                     # VM status / agent / extension state
-                    ###########################################################################
-
                     $vm_status = $null
                     if (-not $NoARM.IsPresent -and $vm.id -and $vmStatusIndexById.ContainsKey($vm.id)) {
                         $vm_status = $vmStatusIndexById[$vm.id]
@@ -1683,11 +1425,8 @@ Resources
                             }
                         }
                     }
-
-                    ###########################################################################
+                    
                     # VM size / SKU enrichment
-                    ###########################################################################
-
                     $vmSize = [string]$vm.vmSize
                     $location = [string]$vm.location
                     $locationKey = if ($location) { $location.ToLowerInvariant() } else { '' }
@@ -1717,11 +1456,8 @@ Resources
                             }
                         }
                     }
-
-                    ###########################################################################
+                    
                     # Placement metadata
-                    ###########################################################################
-
                     $vm_zone = if ($vm.zones) {
                         $vm.zones -join '; '
                     }
@@ -1734,80 +1470,68 @@ Resources
                         $vm_set = ([string]$vm.availSetId -split '/')[-1]
                     }
 
-                    ###########################################################################
+                    
                     # NIC / IP / subnet resolution
-                    ###########################################################################
-
                     $ifName = ''
                     $vNet = ''
                     $subnet = ''
                     $privateIp = ''
                     $privateIpAlloc = ''
 
-                    if ($NoARM.IsPresent) {
-                        # ARG-only mode:
-                        # These are already flattened by the expanded VM_BASE_QUERY.
-                        $ifName = if ($vm.ifName_ARG) { [string]$vm.ifName_ARG } else { '' }
-                        $vNet = if ($vm.vNet_ARG) { [string]$vm.vNet_ARG } else { '' }
-                        $subnet = if ($vm.Subnet_ARG) { [string]$vm.Subnet_ARG } else { '' }
-                        $privateIp = if ($vm.PrivateIP_ARG) { [string]$vm.PrivateIP_ARG } else { '' }
-                        $privateIpAlloc = if ($vm.PrivateIPalloc_ARG) { [string]$vm.PrivateIPalloc_ARG } else { '' }
-                    }
-                    else {
-                        # Full mode:
-                        # Preserve existing ARM/ARG hybrid NIC lookup behavior.
-                        $vm_ip_details = [System.Collections.Generic.List[object]]::new()
+                    # ARG NIC/IP/subnet resolution.
+                    # Works in both NoARM and Full modes because $nicIndexById is built from $NIC_QUERY.
+                    $vm_ip_details = [System.Collections.Generic.List[object]]::new()
 
-                        foreach ($nicRef in @($vm.nicRefs)) {
-                            $nicId = [string]$nicRef.id
+                    foreach ($nicRef in @($vm.nicRefs)) {
+                        $nicId = [string]$nicRef.id
 
-                            if (-not $nicId) {
-                                continue
-                            }
-
-                            if (-not $nicIndexById.ContainsKey($nicId)) {
-                                continue
-                            }
-
-                            $nic = $nicIndexById[$nicId]
-
-                            foreach ($ipConfig in @($nic.ipConfigs)) {
-                                $subnetId = $null
-
-                                if ($ipConfig.properties -and $ipConfig.properties.subnet -and $ipConfig.properties.subnet.id) {
-                                    $subnetId = [string]$ipConfig.properties.subnet.id
-                                }
-
-                                $vnetName = $null
-                                $subnetName = $null
-
-                                if (-not [string]::IsNullOrWhiteSpace($subnetId)) {
-                                    $vnetName = Get-IdSegment -Id $subnetId -SegmentName 'virtualNetworks'
-                                    $subnetName = Get-IdSegment -Id $subnetId -SegmentName 'subnets'
-                                }
-
-                                $vm_ip_details.Add([pscustomobject]@{
-                                        ifName     = $nic.name
-                                        PrivateIP  = $ipConfig.properties.privateIPAddress
-                                        Allocation = $ipConfig.properties.privateIPAllocationMethod
-                                        VNet       = $vnetName
-                                        Subnet     = $subnetName
-                                        Primary    = $ipConfig.properties.primary
-                                    })
-                            }
+                        if ([string]::IsNullOrWhiteSpace($nicId)) {
+                            continue
                         }
 
-                        $ifName = (($vm_ip_details.ifName | Select-Object -Unique) -join ';')
-                        $vNet = (($vm_ip_details.VNet | Where-Object { $_ } | Select-Object -Unique) -join ';')
-                        $subnet = (($vm_ip_details.Subnet | Where-Object { $_ } | Select-Object -Unique) -join ';')
-                        $privateIp = (($vm_ip_details.PrivateIP | Where-Object { $_ } | Select-Object -Unique) -join ';')
-                        $privateIpAlloc = (($vm_ip_details.Allocation | Where-Object { $_ } | Select-Object -Unique) -join ';')
+                        if (-not $nicIndexById.ContainsKey($nicId)) {
+                            continue
+                        }
+
+                        $nic = $nicIndexById[$nicId]
+
+                        foreach ($ipConfig in @($nic.ipConfigs)) {
+                            if (-not $ipConfig -or -not $ipConfig.properties) {
+                                continue
+                            }
+
+                            $subnetId = $null
+
+                            if ($ipConfig.properties.subnet -and $ipConfig.properties.subnet.id) {
+                                $subnetId = [string]$ipConfig.properties.subnet.id
+                            }
+
+                            $vnetName = $null
+                            $subnetName = $null
+
+                            if (-not [string]::IsNullOrWhiteSpace($subnetId)) {
+                                $vnetName = Get-IdSegment -Id $subnetId -SegmentName 'virtualNetworks'
+                                $subnetName = Get-IdSegment -Id $subnetId -SegmentName 'subnets'
+                            }
+
+                            $vm_ip_details.Add([pscustomobject]@{
+                                    ifName     = [string]$nic.name
+                                    PrivateIP  = [string]$ipConfig.properties.privateIPAddress
+                                    Allocation = [string]$ipConfig.properties.privateIPAllocationMethod
+                                    VNet       = $vnetName
+                                    Subnet     = $subnetName
+                                    Primary    = $ipConfig.properties.primary
+                                })
+                        }
                     }
 
-                    ###########################################################################
-                    # Disk resolution
-                    ###########################################################################
+                    $ifName = (($vm_ip_details.ifName | Where-Object { $_ } | Select-Object -Unique) -join ';')
+                    $vNet = (($vm_ip_details.VNet | Where-Object { $_ } | Select-Object -Unique) -join ';')
+                    $subnet = (($vm_ip_details.Subnet | Where-Object { $_ } | Select-Object -Unique) -join ';')
+                    $privateIp = (($vm_ip_details.PrivateIP | Where-Object { $_ } | Select-Object -Unique) -join ';')
+                    $privateIpAlloc = (($vm_ip_details.Allocation | Where-Object { $_ } | Select-Object -Unique) -join ';')
 
+                    # Disk resolution
                     $OSdiskAccessId = 'NA'
                     $os_disk_size_gb = 0
                     $total_disk_size_gb = 0
@@ -1823,7 +1547,7 @@ Resources
                             $OSdiskAccessId = [string]$vm.osDiskAccessId
                         }
 
-                        if ($vm.osDiskSizeGB -ne $null -and [string]$vm.osDiskSizeGB -ne '') {
+                        if ($null -ne $vm.osDiskSizeGB -and [string]$vm.osDiskSizeGB -ne '') {
                             try {
                                 $os_disk_size_gb = [int]$vm.osDiskSizeGB
                             }
@@ -1832,7 +1556,7 @@ Resources
                             }
                         }
 
-                        if ($vm.TotalManagedDiskSizeGB_ARG -ne $null -and [string]$vm.TotalManagedDiskSizeGB_ARG -ne '') {
+                        if ($null -ne $vm.TotalManagedDiskSizeGB_ARG -and [string]$vm.TotalManagedDiskSizeGB_ARG -ne '') {
                             try {
                                 $total_disk_size_gb = [int64]$vm.TotalManagedDiskSizeGB_ARG
                             }
@@ -1907,10 +1631,7 @@ Resources
                         }
                     }
 
-                    ###########################################################################
                     # OS creation / OS guest details
-                    ###########################################################################
-
                     $osCreation = 'NA'
 
                     if ($vm.timeCreated) {
@@ -1969,51 +1690,55 @@ Resources
                         }
                     }
 
-                    ###########################################################################
                     # Final VM object
-                    ###########################################################################
-
                     $vmObject = [ordered]@{
-                        TenantDomain           = $TenantDomain
-                        SubscriptionName       = $subscription_name
-                        ResourceGroupName      = $vm.resourceGroup
-                        Location               = $location
-                        VMName                 = $vm.name
-                        VMStatus               = $powerState
-                        VMSize                 = $vmSize
-                        SKUvcpu                = $vcpuBase
-                        vCPUs                  = $vcpuAvail
-                        MemoryGB               = $memory
-                        Zone                   = $vm_zone
-                        Set                    = $vm_set
-                        VM_Agent_Status        = $vmAgentStatus
-                        AzureMonitorAgent      = $amaStatus
-                        MDEAgent               = $mdeStatus
-                        ifName                 = $ifName
-                        vNet                   = $vNet
-                        Subnet                 = $subnet
-                        PrivateIP              = $privateIp
-                        PrivateIPalloc         = $privateIpAlloc
-                        LicenseType            = $vm.licenseType
-                        OSName                 = $osName
-                        OSVersion              = $osVersion
-                        OSType                 = $vm.osType
-                        OSImagePub             = $vm.imagePub
-                        OSImageSku             = $vm.imageSku
-                        OSDate                 = $osCreation
-                        AdminUserName          = $vm.adminUser
-                        OSDiskAccessId         = $OSdiskAccessId
-                        ManagedOSDiskURI       = $os_disk_details_managed
-                        ManagedOSDiskSizeGB    = $os_disk_size_gb
-                        TotalManagedDiskSizeGB = $total_disk_size_gb
-                        UnManagedOSDiskURI     = $os_disk_details_unmanaged
-                        DataDiskNames          = ($dataDiskNames -join ';')
+                        TenantDomain            = $TenantDomain
+                        SubscriptionName        = $subscription_name
+                        ResourceGroupName       = $vm.resourceGroup
+                        Location                = $location
+                        VMName                  = $vm.name
+                        VMStatus                = $powerState
+                        VMSize                  = $vmSize
+                        SKUvcpu                 = $vcpuBase
+                        vCPUs                   = $vcpuAvail
+                        MemoryGB                = $memory
+                        Zone                    = $vm_zone
+                        Set                     = $vm_set
+                        VM_Agent_Status         = $vmAgentStatus
+                        AzureMonitorAgent       = $amaStatus
+                        MDEAgent                = $mdeStatus
+                        ifName                  = $ifName
+                        vNet                    = $vNet
+                        Subnet                  = $subnet
+                        PrivateIP               = $privateIp
+                        PrivateIPalloc          = $privateIpAlloc
+                        LicenseType             = $vm.licenseType
+                        OSName                  = $osName
+                        OSVersion               = $osVersion
+                        OSType                  = $vm.osType
+                        
+                        OSImagePub              = if ($vm.imagePub) { $vm.imagePub } else { 'N/A' }
+                        OSImageOffer            = if ($vm.imageOffer) { $vm.imageOffer } else { 'N/A' }
+                        OSImageSku              = if ($vm.imageSku) { $vm.imageSku } else { 'N/A' }
+                        OSImageVersion          = if ($vm.imageVersion) { $vm.imageVersion } else { 'N/A' }
+
+                        OSImageId               = if ($vm.imageId) { $vm.imageId } else { 'N/A' }
+                        OSImageExactVersion     = if ($vm.imageExactVersion) { $vm.imageExactVersion } else { 'N/A' }
+                        SharedGalleryImageId    = if ($vm.sharedGalleryImageId) { $vm.sharedGalleryImageId } else { 'N/A' }
+                        CommunityGalleryImageId = if ($vm.communityGalleryImageId) { $vm.communityGalleryImageId } else { 'N/A' }
+
+                        OSDate                  = $osCreation
+                        AdminUserName           = $vm.adminUser
+                        OSDiskAccessId          = $OSdiskAccessId
+                        ManagedOSDiskURI        = $os_disk_details_managed
+                        ManagedOSDiskSizeGB     = $os_disk_size_gb
+                        TotalManagedDiskSizeGB  = $total_disk_size_gb
+                        UnManagedOSDiskURI      = $os_disk_details_unmanaged
+                        DataDiskNames           = ($dataDiskNames -join ';')
                     }
 
-                    ###########################################################################
-                    # Raw tag preservation for global tag header normalization
-                    ###########################################################################
 
+                    # Raw tag preservation for global tag header normalization
                     $vmTagTable = @{}
 
                     if ($vm.Tags) {
@@ -2028,60 +1753,84 @@ Resources
                 }
 
                 Add-RangeSafe -Target $AzVM_Inventory -Items $virtual_machine_object
+            }
+            #################################
+            #endregion Virtual Machine Details (ARG-first)
 
-                #################################
-                #endregion Virtual Machine Details (ARG-first)
 
-            $Azure_NSG_output = foreach ($azureNSGDetails_Iterator in $azureNSGDetails) {
-                $securityRulesPerNSG = $azureNSGDetails_Iterator.SecurityRules
+            #region Network Security Groups Details (ARG-native)
+            #################################
+            $Azure_NSG_output = foreach ($nsg in $nsgRowsArg | Where-Object { $_.subscriptionId -eq $subscription_id }) {
 
-                $NSG_NICs = foreach ($NSG_NIC_ID in $azureNSGDetails_Iterator.NetworkInterfaces.Id) {
-                    $azureNICDetails.Where({ $_.Id -eq $NSG_NIC_ID })
-                }
+                $resolvedNICs = @()
+                $resolvedVMs = @()
+                $resolvedIPs = @()
+                $resolvedPIPs = @()
 
-                $NSG_NICs_VMs = foreach ($NSG_NIC in $NSG_NICs) {
-                    $vmId = $null
-                    try { $vmId = [string]$NSG_NIC.VirtualMachine.Id } catch { $vmId = $null }
-                    if ($vmId -and $vmNameById.ContainsKey($vmId)) { $vmNameById[$vmId] }
-                }
+                foreach ($nicRef in @($nsg.networkInterfaces)) {
+                    $nicId = [string]$nicRef.id
 
-                $NSG_NICs_PIP = foreach ($IP_Conf_Id in $NSG_NICs.IpConfigurations.Id) {
-                    $azurePublicIPs.Where({ $_.IpConfiguration.Id -eq $IP_Conf_Id })
-                }
+                    if ([string]::IsNullOrWhiteSpace($nicId)) { continue }
+                    if (-not $nicIndexById.ContainsKey($nicId)) { continue }
 
-                $NSG_Subnets = foreach ($Subnet_Iterator in $azureNSGDetails_Iterator.Subnets) {
-                    $Subnet_Iterator.Id.Split('/') | Select-Object -Last 1
-                }
+                    $nic = $nicIndexById[$nicId]
+                    $resolvedNICs += $nic.name
 
-                foreach ($securityRulesPerNSG_Iterator in $securityRulesPerNSG) {
-                    [pscustomobject]@{
-                        TenantDomain             = $TenantDomain
-                        Subscription             = $subscription_name
-                        Resourc_Group            = $azureNSGDetails_Iterator.ResourceGroupName
-                        Location                 = $azureNSGDetails_Iterator.Location
-                        NSG_Name                 = $azureNSGDetails_Iterator.Name
-                        Rule_Name                = $securityRulesPerNSG_Iterator.Name
-                        Priority                 = $securityRulesPerNSG_Iterator.Priority
-                        Protocol                 = $securityRulesPerNSG_Iterator.Protocol
-                        Direction                = $securityRulesPerNSG_Iterator.Direction
-                        SourcePortRange          = ($securityRulesPerNSG_Iterator | Select-Object @{ Name = 'SPR'; Expression = { $_.SourcePortRange } }).SPR
-                        DestinationPortRange     = ($securityRulesPerNSG_Iterator | Select-Object @{ Name = 'DPR'; Expression = { $_.DestinationPortRange } }).DPR
-                        SourceAddressPrefix      = ($securityRulesPerNSG_Iterator | Select-Object @{ Name = 'SAP'; Expression = { $_.SourceAddressPrefix } }).SAP
-                        DestinationAddressPrefix = ($securityRulesPerNSG_Iterator | Select-Object @{ Name = 'DAP'; Expression = { $_.DestinationAddressPrefix } }).DAP
-                        Access                   = $securityRulesPerNSG_Iterator.Access
-                        'NSG VMs'                = (($NSG_NICs_VMs) -join ';')
-                        'NSG NICs'               = (($NSG_NICs.Name) -join ';')
-                        'NSG NIC IP'             = (($NSG_NICs.IpConfigurations.PrivateIpAddress) -join ';')
-                        'NSG NIC PIP'            = (($NSG_NICs_PIP.IpAddress) -join ';')
-                        'NSG Subnets'            = (($NSG_Subnets) -join ';')
-                        Description              = $securityRulesPerNSG_Iterator.Description
+                    foreach ($ipConf in @($nic.ipConfigs)) {
+
+                        if ($ipConf.properties.privateIPAddress) {
+                            $resolvedIPs += [string]$ipConf.properties.privateIPAddress
+                        }
+
+                        if ($nic.virtualMachineId -and $vmNameById.ContainsKey($nic.virtualMachineId)) {
+                            $resolvedVMs += $vmNameById[$nic.virtualMachineId]
+                        }
+
+                        if ($ipConf.properties.publicIPAddress -and $ipConf.properties.publicIPAddress.id) {
+                            $pipId = [string]$ipConf.properties.publicIPAddress.id
+
+                            if ($pipArgById.ContainsKey($pipId)) {
+                                $resolvedPIPs += $pipArgById[$pipId].PublicIpAddress
+                            }
+                        }
                     }
+                }
+
+                $subnetNames = foreach ($s in @($nsg.subnets)) {
+                    if ($s.id) { Get-IdSegment -Id $s.id -SegmentName 'subnets' }
+                }
+
+                [pscustomobject]@{
+                    TenantDomain             = $TenantDomain
+                    Subscription             = $subscription_name
+                    Resourc_Group            = $nsg.resourceGroup
+                    Location                 = $nsg.location
+                    NSG_Name                 = $nsg.NSG_Name
+                    Rule_Name                = $nsg.Rule_Name
+                    Priority                 = $nsg.Priority
+                    Protocol                 = $nsg.Protocol
+                    Direction                = $nsg.Direction
+                    SourcePortRange          = $nsg.SourcePortRange
+                    DestinationPortRange     = $nsg.DestinationPortRange
+                    SourceAddressPrefix      = $nsg.SourceAddressPrefix
+                    DestinationAddressPrefix = $nsg.DestinationAddressPrefix
+                    Access                   = $nsg.Access
+
+                    'NSG VMs'                = (($resolvedVMs | Select-Object -Unique) -join ';')
+                    'NSG NICs'               = (($resolvedNICs | Select-Object -Unique) -join ';')
+                    'NSG NIC IP'             = (($resolvedIPs  | Select-Object -Unique) -join ';')
+                    'NSG NIC PIP'            = (($resolvedPIPs | Select-Object -Unique) -join ';')
+
+                    'NSG Subnets'            = (($subnetNames | Select-Object -Unique) -join ';')
+                    Description              = $nsg.Description
                 }
             }
 
             Add-RangeSafe -Target $AzNSG_Inventory -Items $Azure_NSG_output
-            #################################
-            #endregion Network Security Groups Details
+
+            #endregion Network Security Groups Details (ARG-native)
+
+
             #region Virtual Network Details (from tenant ARG)
 
             $Output_vNets = foreach ($vnetRow in ($vNetRows | Where-Object { $_.subscriptionId -eq $subscription_id })) {
@@ -2154,44 +1903,102 @@ Resources
             Add-RangeSafe -Target $AzPIP_Inventory -Items $Output_PIP
             #################################
             #endregion Public IP Details
+
+
             #region Load Balancer Details
             #################################
 
             $azure_load_balancer_object = [System.Collections.Generic.List[object]]::new()
 
-            # Index Public IPs by resource ID for quick resolution
-            $pipById = @{}
-            foreach ($p in @($azurePublicIPs)) {
-                if ($p -and $p.Id) { $pipById[[string]$p.Id] = $p }
-            }
+            # Index Public IPs by resource ID for quick resolution (ARG-based)
+            $pipById = $pipArgById
 
             foreach ($lb in @($AzureLBList)) {
+
                 $feNames = @($lb.FrontendIpConfigurations | ForEach-Object { $_.Name } | Where-Object { $_ })
                 $beNames = @($lb.BackendAddressPools      | ForEach-Object { $_.Name } | Where-Object { $_ })
 
-                # Collect all frontend IPs (private and/or public) into one list
+                # Collect all frontend IPs (private and/or public)
                 $frontendIps = [System.Collections.Generic.List[string]]::new()
 
                 foreach ($fe in @($lb.FrontendIpConfigurations)) {
                     if (-not $fe) { continue }
 
+                    # Private IP
                     if ($fe.PrivateIpAddress) {
                         $frontendIps.Add([string]$fe.PrivateIpAddress)
                     }
 
+                    # Public IP via ARG
                     if ($fe.PublicIpAddress -and $fe.PublicIpAddress.Id) {
+
                         $pubid = [string]$fe.PublicIpAddress.Id
-                        if ($pipById.ContainsKey($pubid) -and $pipById[$pubid].IpAddress) {
-                            $frontendIps.Add([string]$pipById[$pubid].IpAddress)
+
+                        $pip = $null
+                        if ($pipById.ContainsKey($pubid)) {
+                            $pip = $pipById[$pubid]
+                        }
+
+                        if ($pip -and -not [string]::IsNullOrWhiteSpace($pip.PublicIpAddress)) {
+                            $frontendIps.Add([string]$pip.PublicIpAddress)
                         }
                         else {
-                            $frontendIps.Add(('PIP:' + (($pubid -split '/')[-1])))
+                            # Fallback if ARG hasn't populated IP yet
+                            $frontendIps.Add("PIP:$(( $pubid -split '/' )[-1])")
                         }
                     }
                 }
 
                 $frontendIpText = ($frontendIps | Where-Object { $_ } | Select-Object -Unique) -join ';'
 
+                # Backend correlation
+                $backendNICs = @()
+                $backendVMs = @()
+                $backendIPs = @()
+
+                foreach ($pool in @($lb.BackendAddressPools)) {
+
+                    # --- NIC-based backend resolution ---
+                    foreach ($ipRef in @($pool.BackendIpConfigurations)) {
+
+                        $ipId = [string]$ipRef.Id
+                        if (-not $ipId) { continue }
+
+                        $nicId = $ipId -replace '/ipConfigurations/.+$', ''
+                        if (-not $nicIndexById.ContainsKey($nicId)) { continue }
+
+                        $nic = $nicIndexById[$nicId]
+
+                        # NIC name
+                        $backendNICs += $nic.name
+
+                        # VM resolution
+                        if ($nic.virtualMachineId -and $vmNameById.ContainsKey($nic.virtualMachineId)) {
+                            $backendVMs += $vmNameById[$nic.virtualMachineId]
+                        }
+
+                        # Private IP
+                        foreach ($ipconf in @($nic.ipConfigs)) {
+                            if ($ipconf.properties.privateIPAddress) {
+                                $backendIPs += [string]$ipconf.properties.privateIPAddress
+                            }
+                        }
+                    }
+
+                    # --- IP-based backend fallback ---
+                    foreach ($addr in @($pool.LoadBalancerBackendAddresses)) {
+
+                        if ($addr.IpAddress) {
+                            $backendIPs += [string]$addr.IpAddress
+                        }
+
+                        if ($addr.Name) {
+                            $backendNICs += "IPBackend:$($addr.Name)"
+                        }
+                    }
+                }
+
+                # Final object
                 $azure_load_balancer_object.Add([pscustomobject]@{
                         Tenant                       = $TenantDomain
                         Subscription                 = $subscription_name
@@ -2201,10 +2008,16 @@ Resources
                         Location                     = $lb.Location
                         FrontendIpConfigurationsName = (($feNames | Select-Object -Unique) -join ';')
                         BackendAddressPoolsName      = (($beNames | Select-Object -Unique) -join ';')
+
+                        # ✅ New fields
+                        BackendNICs                  = (($backendNICs | Select-Object -Unique) -join ';')
+                        BackendVMs                   = (($backendVMs  | Select-Object -Unique) -join ';')
+                        BackendPrivateIPs            = (($backendIPs  | Select-Object -Unique) -join ';')
                     })
             }
 
             Add-RangeSafe -Target $AzLBe_Inventory -Items $azure_load_balancer_object
+
             #################################
             #endregion Load Balancer Details
 
@@ -2255,6 +2068,10 @@ Resources
 
 #region Build and Export
 #################################
+
+Write-Host "VM count: $($AzVM_Inventory.Count)"
+Write-Host "vNet count: $($AzvNet_Inventory.Count)"
+Write-Host "PIP count: $($AzPIP_Inventory.Count)"
 
 # Build global tag header list once (after all tenants)
 $globalTagHeaderList = @($globalTagKeysRaw) | Sort-Object
@@ -2330,18 +2147,51 @@ try {
         throw "RunOutputFolder is not set or does not exist. Cannot export."
     }
 
+    # Add suffix for partial (NoARM) mode
+    $runModeSuffix = if ($NoARM.IsPresent) { "-partial" } else { "" }
+
     Set-Location $script:RunOutputFolder
 
     if ($AzVM_Inventory_multi_export.Count -gt 0) {
-        $AzVM_Inventory_multi_export | Export-Csv (('{0}{1}.csv' -f $CSV_VM_name, $runStampText)) -NoTypeInformation -Force
+        $AzVM_Inventory_multi_export | Export-Csv (('{0}{1}{2}.csv' -f $CSV_VM_name, $runStampText, $runModeSuffix)) -NoTypeInformation -Force
     }
-    if ($AzNSG_Inventory_multi.Count -gt 0) { $AzNSG_Inventory_multi  | Export-Csv (("NSG_Custom_{0}.csv" -f $runStampText)) -NoTypeInformation -Force }
-    if ($AzvNet_Inventory_multi.Count -gt 0) { $AzvNet_Inventory_multi | Export-Csv (("vNet_{0}.csv" -f $runStampText)) -NoTypeInformation -Force }
-    if ($AzPIP_Inventory_multi.Count -gt 0) { $AzPIP_Inventory_multi  | Export-Csv (("PIP_{0}.csv" -f $runStampText)) -NoTypeInformation -Force }
-    if ($AzLBe_Inventory_multi.Count -gt 0) { $AzLBe_Inventory_multi  | Export-Csv (("LBe_{0}.csv" -f $runStampText)) -NoTypeInformation -Force }
-    if ($AzOrphanDisk_Inventory_multi.Count -gt 0) { $AzOrphanDisk_Inventory_multi | Export-Csv (("Orphan_Disk_{0}.csv" -f $runStampText)) -NoTypeInformation -Force }
-    if ($AzOrphanNIC_Inventory_multi.Count -gt 0) { $AzOrphanNIC_Inventory_multi  | Export-Csv (("Orphan_NIC_{0}.csv" -f $runStampText)) -NoTypeInformation -Force }
+    if ($AzNSG_Inventory_multi.Count -gt 0) {
+        $AzNSG_Inventory_multi | Export-Csv (("NSG_Custom_{0}{1}.csv" -f $runStampText, $runModeSuffix)) -NoTypeInformation -Force
+    }
+    if ($AzvNet_Inventory_multi.Count -gt 0) {
+        $AzvNet_Inventory_multi | Export-Csv (("vNet_{0}{1}.csv" -f $runStampText, $runModeSuffix)) -NoTypeInformation -Force
+    }
+    if ($AzPIP_Inventory_multi.Count -gt 0) {
+        $AzPIP_Inventory_multi | Export-Csv (("PIP_{0}{1}.csv" -f $runStampText, $runModeSuffix)) -NoTypeInformation -Force
+    }
+    if ($AzLBe_Inventory_multi.Count -gt 0) {
+        $AzLBe_Inventory_multi | Export-Csv (("LBe_{0}{1}.csv" -f $runStampText, $runModeSuffix)) -NoTypeInformation -Force
+    }
+    if ($AzOrphanDisk_Inventory_multi.Count -gt 0) {
+        $AzOrphanDisk_Inventory_multi | Export-Csv (("Orphan_Disk_{0}{1}.csv" -f $runStampText, $runModeSuffix)) -NoTypeInformation -Force
+    }
+    if ($AzOrphanNIC_Inventory_multi.Count -gt 0) {
+        $AzOrphanNIC_Inventory_multi | Export-Csv (("Orphan_NIC_{0}{1}.csv" -f $runStampText, $runModeSuffix)) -NoTypeInformation -Force
+    }
 
+    $ScriptEndTime = Get-Date
+    $ActualRuntime = $ScriptEndTime - $ScriptStartTime
+
+    Write-Host ""
+    Write-Host (
+        "Script started : {0}" -f
+        $ScriptStartTime.ToString('yyyy-MM-dd HH:mm:ss')
+    ) -ForegroundColor DarkGray
+
+    Write-Host (
+        "Script ended   : {0}" -f
+        $ScriptEndTime.ToString('yyyy-MM-dd HH:mm:ss')
+    ) -ForegroundColor DarkGray
+
+    Write-Host (
+        "Actual runtime : {0}" -f
+        $ActualRuntime.ToString('hh\:mm\:ss')
+    ) -ForegroundColor Magenta
 
     Write-Host ("Inventory exported to: {0}" -f $script:RunOutputFolder) -ForegroundColor Green
 }
